@@ -1460,6 +1460,99 @@ levelupCardEls.forEach(function (el, i) {
 });
 
 // -------------------------------------------------------------
+// SECTION: PAUSE MENU
+// Esc toggles between "play" and "pause" (update() already no-ops
+// outside "play", so pausing is just switching modes + showing the
+// dimmed overlay -- same trick as the level-up panel). Restart wipes
+// every piece of mutable state back to its starting value and jumps
+// straight back into "play".
+// -------------------------------------------------------------
+var pauseOverlayEl = document.getElementById("pause-overlay");
+var resumeBtn = document.getElementById("resume-btn");
+var restartBtn = document.getElementById("restart-btn");
+
+function pauseGame() {
+  STATE.mode = "pause";
+  pauseOverlayEl.classList.remove("hidden");
+}
+
+function resumeGame() {
+  STATE.mode = "play";
+  pauseOverlayEl.classList.add("hidden");
+}
+
+// Puts every piece of mutable state back to its starting value. Used by
+// the pause menu's Restart button now, and reusable by Game Over /
+// Victory's Restart once those exist (Prompt 7).
+function resetGame() {
+  STATE.elapsed = 0;
+  STATE.kills = 0;
+
+  player.x = CONFIG.WORLD_W / 2;
+  player.y = CONFIG.WORLD_H / 2;
+  player.hp = CONFIG.PLAYER_HP_MAX;
+  player.angle = 0;
+  player.iframe = 0;
+  player.level = 1;
+  player.xp = 0;
+  player.xpToNext = CONFIG.XP_BASE;
+  player.hpMax = CONFIG.PLAYER_HP_MAX;
+  player.speedMult = 1;
+  player.magnet = CONFIG.PLAYER_MAGNET;
+  player.armor = 0;
+  player.regen = 0;
+
+  camera.x = 0;
+  camera.y = 0;
+
+  weapons.pistol.dmg = CONFIG.PISTOL_DMG;
+  weapons.pistol.fireInterval = CONFIG.PISTOL_FIRE_INTERVAL;
+  weapons.shotgun.unlocked = false;
+  weapons.shotgun.pelletCount = CONFIG.SHOTGUN_PELLET_COUNT;
+  weapons.shotgun.dmg = CONFIG.SHOTGUN_PELLET_DMG;
+  weapons.drone.unlocked = false;
+  weapons.drone.dmg = CONFIG.DRONE_DMG;
+  weapons.drone.count = 0;
+  drones = [];
+
+  enemies = [];
+  walkerSpawnTimer = 0;
+  runnerSpawnTimer = 0;
+  bruteSpawnTimer = 0;
+  shooterSpawnTimer = 0;
+  perfLogTimer = 2;
+
+  bullets = [];
+  pistolCooldown = 0;
+  shotgunCooldown = 0;
+  muzzleFlashSize = CONFIG.MUZZLE_FLASH_SIZE;
+  muzzleFlashTimer = 0;
+
+  damageNumbers = [];
+  screenShake = 0;
+
+  gems = [];
+  gemComboCount = 0;
+  gemComboTimer = 0;
+
+  pendingLevelUps = 0;
+  currentCards = [];
+  levelupOverlayEl.classList.add("hidden");
+
+  pauseOverlayEl.classList.add("hidden");
+  STATE.mode = "play";
+}
+
+resumeBtn.addEventListener("click", resumeGame);
+restartBtn.addEventListener("click", resetGame);
+
+window.addEventListener("keydown", function (e) {
+  if (e.key !== "Escape") return;
+  if (STATE.mode === "play") pauseGame();
+  else if (STATE.mode === "pause") resumeGame();
+});
+
+// -------------------------------------------------------------
 // SECTION: TITLE OVERLAY
 // The Start button hides the overlay and switches mode to "play".
 // Audio must init here too, since it needs a user click.
