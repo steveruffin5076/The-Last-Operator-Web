@@ -157,6 +157,9 @@ var CONFIG = {
   LEVELUP_FLASH_TIME: 0.5, // seconds the ring around the player takes to expand + fade
   LEVELUP_RING_MAX_RADIUS: 90,
 
+  AUDIO_MASTER_GAIN: 0.22, // overall volume, per tech-web.md
+  ENEMY_DIE_SOUND_THROTTLE: 0.06, // seconds between "enemy_die" blips, so a kill spree isn't a wall of noise
+
   BOSS_HP: 2500,
   BOSS_TOUCH_DMG: 30,
   BOSS_SPEED: 55,
@@ -380,23 +383,137 @@ function getMoveVector() {
 }
 
 // -------------------------------------------------------------
-// SECTION: AUDIO (stub)
-// Real WebAudio oscillator SFX come in a later prompt. For now
-// this is just a placeholder so the section exists and other
-// code can safely call audioInit() without erroring.
+// SECTION: AUDIO
+// No audio files, ever (tech-web.md) -- every sound is a plain
+// oscillator "bleep" built with tone(f0, f1, dur, type, vol). All of
+// it is wrapped in try/catch: a browser that blocks/throws on audio
+// (e.g. some incognito setups) should never crash the game over it.
 // -------------------------------------------------------------
 var audioCtx = null;
+var masterGain = null; // single volume knob everything routes through
+var muted = false; // toggled by the M key
+var dieSoundCooldown = 0; // throttles "enemy_die" so a kill spree isn't a wall of noise
 
 function audioInit() {
-  // Browsers require a user gesture (like clicking Start) before
-  // audio can play, so this is called from the Start button handler.
-  // Real oscillator sounds are added in a later prompt.
+  // Browsers require a user gesture (like clicking Start) before audio
+  // can play -- this is called from the Start button's click handler.
+  if (audioCtx) return; // already set up
+  try {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    masterGain = audioCtx.createGain();
+    masterGain.gain.value = CONFIG.AUDIO_MASTER_GAIN;
+    masterGain.connect(audioCtx.destination);
+  } catch (e) {
+    console.error("WebAudio init failed:", e);
+  }
 }
 
-// Named hook so weapon code can call playSound('pistol_pew') etc. now,
-// without needing to change when Prompt 9 wires up real WebAudio SFX.
+function toggleMute() {
+  muted = !muted;
+  if (masterGain) {
+    masterGain.gain.value = muted ? 0 : CONFIG.AUDIO_MASTER_GAIN;
+  }
+}
+
+window.addEventListener("keydown", function (e) {
+  if (e.key.toLowerCase() === "m") toggleMute();
+});
+
+// One oscillator that glides from f0 to f1 Hz over `dur` seconds, with a
+// short fade-in/out envelope so it doesn't click. `type` is the waveform
+// (square/sawtooth/sine/triangle), `vol` is 0-1 on top of the master gain.
+// This one helper covers every SFX in the game -- see playSound() below.
+function tone(f0, f1, dur, type, vol) {
+  if (!audioCtx || muted) return;
+  try {
+    var osc = audioCtx.createOscillator();
+    var gain = audioCtx.createGain();
+    var now = audioCtx.currentTime;
+
+    osc.type = type;
+    osc.frequency.setValueAtTime(f0, now);
+    osc.frequency.linearRampToValueAtTime(f1, now + dur);
+
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(vol, now + 0.01);
+    gain.gain.linearRampToValueAtTime(0, now + dur);
+
+    osc.connect(gain);
+    gain.connect(masterGain);
+    osc.start(now);
+    osc.stop(now + dur);
+  } catch (e) {
+    console.error("tone() failed:", e);
+  }
+}
+
+// Named hook every gameplay system calls (playSound('pistol_pew') etc.)
+// so this is the only place that needs to know what each SFX sounds like.
 function playSound(name) {
-  // no-op stub
+  if (!audioCtx) return;
+  try {
+    switch (name) {
+      case "pistol_pew":
+        tone(900, 500, 0.08, "square", 1);
+        break;
+
+      case "shotgun_boom":
+        tone(180, 60, 0.25, "sawtooth", 1);
+        break;
+
+      case "gem_pickup":
+        // Pitch rises with the combo count (capped so it can't go ultrasonic).
+        var basePitch = 600 + Math.min(gemComboCount, 10) * 40;
+        tone(basePitch, basePitch * 1.4, 0.1, "sine", 0.8);
+        break;
+
+      case "levelup_arp":
+        // Quick 3-note major arpeggio: C5, E5, G5.
+        tone(523, 523, 0.08, "square", 0.9);
+        window.setTimeout(function () { tone(659, 659, 0.08, "square", 0.9); }, 80);
+        window.setTimeout(function () { tone(784, 784, 0.15, "square", 0.9); }, 160);
+        break;
+
+      case "hurt":
+        tone(220, 120, 0.15, "sawtooth", 0.9);
+        break;
+
+      case "enemy_die":
+        if (dieSoundCooldown > 0) return; // throttled -- see ENEMY_DIE_SOUND_THROTTLE
+        dieSoundCooldown = CONFIG.ENEMY_DIE_SOUND_THROTTLE;
+        tone(300, 100, 0.08, "square", 0.5);
+        break;
+
+      case "airstrike_whistle":
+        tone(1600, 200, 0.5, "sine", 0.8);
+        break;
+
+      case "boss_roar":
+        tone(90, 40, 0.6, "sawtooth", 1);
+        break;
+
+      case "win_jingle":
+        // Rising 4-note fanfare: C5, E5, G5, C6.
+        tone(523, 523, 0.12, "square", 0.9);
+        window.setTimeout(function () { tone(659, 659, 0.12, "square", 0.9); }, 120);
+        window.setTimeout(function () { tone(784, 784, 0.12, "square", 0.9); }, 240);
+        window.setTimeout(function () { tone(1047, 1047, 0.3, "square", 0.9); }, 360);
+        break;
+
+      case "lose_jingle":
+        // Falling minor tones.
+        tone(300, 300, 0.15, "sawtooth", 0.9);
+        window.setTimeout(function () { tone(250, 250, 0.15, "sawtooth", 0.9); }, 150);
+        window.setTimeout(function () { tone(180, 90, 0.4, "sawtooth", 0.9); }, 300);
+        break;
+
+      case "ui_click":
+        tone(700, 700, 0.04, "square", 0.5);
+        break;
+    }
+  } catch (e) {
+    console.error("playSound() failed:", e);
+  }
 }
 
 // -------------------------------------------------------------
@@ -488,6 +605,7 @@ function killEnemy(index, e) {
   STATE.kills++;
   spawnGem(e.x, e.y, e.xp);
   spawnDeathParticles(e.x, e.y);
+  playSound("enemy_die");
 
   if (e.type === "boss") {
     triggerVictory();
@@ -1139,6 +1257,10 @@ function update(dt) {
   updateHurtVignette(dt);
   updateLevelUpFlash(dt);
 
+  if (dieSoundCooldown > 0) {
+    dieSoundCooldown -= dt;
+  }
+
   if (player.hp <= 0) {
     triggerGameOver();
   }
@@ -1700,6 +1822,7 @@ function pickUpgrade(index) {
   if (!upgrade) return;
 
   upgrade.apply();
+  playSound("ui_click");
   pendingLevelUps--;
 
   if (pendingLevelUps > 0) {
@@ -1729,11 +1852,13 @@ var restartBtn = document.getElementById("restart-btn");
 function pauseGame() {
   STATE.mode = "pause";
   pauseOverlayEl.classList.remove("hidden");
+  playSound("ui_click");
 }
 
 function resumeGame() {
   STATE.mode = "play";
   pauseOverlayEl.classList.add("hidden");
+  playSound("ui_click");
 }
 
 // Puts every piece of mutable state back to its starting value. Used by
@@ -1794,6 +1919,7 @@ function resetGame() {
   hurtVignetteTimer = 0;
   hurtVignetteEl.style.opacity = 0;
   levelUpFlashTimer = 0;
+  dieSoundCooldown = 0;
 
   gems = [];
   gemComboCount = 0;
@@ -1807,6 +1933,7 @@ function resetGame() {
   gameoverOverlayEl.classList.add("hidden");
   victoryOverlayEl.classList.add("hidden");
   STATE.mode = "play";
+  playSound("ui_click");
 }
 
 resumeBtn.addEventListener("click", resumeGame);
@@ -1847,6 +1974,7 @@ function triggerGameOver() {
   gameoverStatsEl.textContent =
     "Time: " + formatTime(STATE.elapsed) + "   Kills: " + STATE.kills + "   Level: " + player.level;
   gameoverOverlayEl.classList.remove("hidden");
+  playSound("lose_jingle");
 }
 
 function triggerVictory() {
@@ -1855,6 +1983,7 @@ function triggerVictory() {
     "Time: " + formatTime(STATE.elapsed) + "   Kills: " + STATE.kills + "   Level: " + player.level +
     "   Damage Dealt: " + STATE.damageDealt;
   victoryOverlayEl.classList.remove("hidden");
+  playSound("win_jingle");
 }
 
 function restartFromEndScreen() {
