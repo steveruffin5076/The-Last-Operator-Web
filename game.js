@@ -25,6 +25,21 @@ var CONFIG = {
   PLAYER_MAGNET: 80, // gem pickup radius, used in a later prompt
   PLAYER_SPRITE_W: 32, // draw size (GDD: soldier 32x42)
   PLAYER_SPRITE_H: 42,
+  PLAYER_RADIUS: 14, // collision circle for touch damage
+  PLAYER_IFRAME_TIME: 0.5, // seconds of invulnerability after being hit
+
+  WALKER_HP: 22,
+  WALKER_TOUCH_DMG: 10,
+  WALKER_SPEED: 75,
+  WALKER_XP: 1, // used once gems exist in a later prompt
+  WALKER_RADIUS: 13,
+  WALKER_DRAW_SIZE: 40,
+
+  SPAWN_RING_MIN: 720, // walkers spawn in a ring this far from the player...
+  SPAWN_RING_MAX: 940, // ...so they never pop into view
+  SPAWN_INTERVAL: 1.0, // seconds between spawns
+  SPAWN_CAP: 25, // max walkers alive at once (Min 0-2 per wave table)
+  DESPAWN_DIST: 1300, // walkers this far away get removed (no XP refund)
 };
 
 // -------------------------------------------------------------
@@ -43,6 +58,7 @@ var player = {
   y: CONFIG.WORLD_H / 2,
   hp: CONFIG.PLAYER_HP_MAX,
   angle: 0, // radians, which way the sprite is rotated to face
+  iframe: 0, // seconds left of "can't be hit again" after taking damage
 };
 
 // Camera = top-left corner of the view into the world, in world pixels.
@@ -50,6 +66,10 @@ var camera = {
   x: 0,
   y: 0,
 };
+
+// All walkers currently alive, as plain {x, y, hp, radius} objects.
+var enemies = [];
+var spawnTimer = 0; // counts down to the next walker spawn
 
 // -------------------------------------------------------------
 // SECTION: ASSET LOADER
@@ -157,6 +177,67 @@ function audioInit() {
 }
 
 // -------------------------------------------------------------
+// SECTION: ENEMIES
+// Walkers are plain objects in an array (no classes needed).
+// The spawner drops one in a ring around the player every second;
+// each walker just walks straight at the player until it touches
+// them or wanders too far away.
+// -------------------------------------------------------------
+function spawnWalker() {
+  // Pick a random point on a ring around the player so walkers
+  // appear just off-screen instead of popping into view.
+  var angle = Math.random() * Math.PI * 2;
+  var dist = CONFIG.SPAWN_RING_MIN + Math.random() * (CONFIG.SPAWN_RING_MAX - CONFIG.SPAWN_RING_MIN);
+
+  enemies.push({
+    x: player.x + Math.cos(angle) * dist,
+    y: player.y + Math.sin(angle) * dist,
+    hp: CONFIG.WALKER_HP,
+    radius: CONFIG.WALKER_RADIUS,
+  });
+}
+
+function updateEnemies(dt) {
+  // Spawner: drop a new walker every SPAWN_INTERVAL seconds, up to the cap.
+  spawnTimer -= dt;
+  if (spawnTimer <= 0) {
+    spawnTimer = CONFIG.SPAWN_INTERVAL;
+    if (enemies.length < CONFIG.SPAWN_CAP) {
+      spawnWalker();
+    }
+  }
+
+  // Loop backwards so splice() (removing an enemy) doesn't skip the
+  // next one -- a classic bug when removing items while looping forward.
+  for (var i = enemies.length - 1; i >= 0; i--) {
+    var e = enemies[i];
+    var dx = player.x - e.x;
+    var dy = player.y - e.y;
+    var dist = Math.sqrt(dx * dx + dy * dy);
+
+    // Wandered off too far (e.g. player ran away) -- just remove it,
+    // no XP refund, per the spawner rules.
+    if (dist > CONFIG.DESPAWN_DIST) {
+      enemies.splice(i, 1);
+      continue;
+    }
+
+    // Walk straight toward the player.
+    if (dist > 0) {
+      e.x += (dx / dist) * CONFIG.WALKER_SPEED * dt;
+      e.y += (dy / dist) * CONFIG.WALKER_SPEED * dt;
+    }
+
+    // Touch damage: only if close enough AND player isn't in i-frames.
+    var touchDist = CONFIG.PLAYER_RADIUS + e.radius;
+    if (dist < touchDist && player.iframe <= 0) {
+      player.hp = clamp(player.hp - CONFIG.WALKER_TOUCH_DMG, 0, CONFIG.PLAYER_HP_MAX);
+      player.iframe = CONFIG.PLAYER_IFRAME_TIME;
+    }
+  }
+}
+
+// -------------------------------------------------------------
 // SECTION: UPDATE (stub)
 // Game logic (movement, collisions, spawning...) goes here in
 // later prompts. Right now there's nothing to simulate yet.
@@ -178,11 +259,17 @@ function update(dt) {
     player.angle = Math.atan2(move.dx, -move.dy);
   }
 
+  // count down i-frames after being hit
+  if (player.iframe > 0) {
+    player.iframe -= dt;
+  }
+
   // --- camera follows player, clamped so it never shows outside the world ---
   camera.x = clamp(player.x - CONFIG.CANVAS_W / 2, 0, CONFIG.WORLD_W - CONFIG.CANVAS_W);
   camera.y = clamp(player.y - CONFIG.CANVAS_H / 2, 0, CONFIG.WORLD_H - CONFIG.CANVAS_H);
 
-  // (future gameplay code goes here)
+  updateEnemies(dt);
+  updateHud();
 }
 
 function clamp(value, min, max) {
@@ -198,6 +285,17 @@ var canvas = document.getElementById("game");
 var ctx = canvas.getContext("2d");
 var bgPattern = null; // built once bg_asphalt.png has loaded
 
+// DOM HUD elements (grabbed once, updated every frame in updateHud()).
+var hpBarEl = document.getElementById("hud-hp-bar");
+var hpTextEl = document.getElementById("hud-hp-text");
+
+function updateHud() {
+  var pct = player.hp / CONFIG.PLAYER_HP_MAX;
+  hpBarEl.style.width = pct * 100 + "%";
+  hpBarEl.style.background = pct < 0.3 ? "#e33" : "#3ecf5e"; // red warning when low
+  hpTextEl.textContent = Math.ceil(player.hp) + "/" + CONFIG.PLAYER_HP_MAX;
+}
+
 function render() {
   // Fallback flat color in case the pattern isn't ready yet.
   ctx.fillStyle = "#141414";
@@ -205,6 +303,7 @@ function render() {
 
   if (assetsReady) {
     drawTiledBackground();
+    drawEnemies();
     drawPlayer();
   } else {
     ctx.fillStyle = "#e6e6e6";
@@ -232,6 +331,24 @@ function drawTiledBackground() {
   // Fill exactly the area the camera can see (in world space).
   ctx.fillRect(camera.x, camera.y, CONFIG.CANVAS_W, CONFIG.CANVAS_H);
   ctx.restore();
+}
+
+// Draws every walker at its screen position (world pos minus camera).
+// No rotation -- the art is a static top-down pose.
+function drawEnemies() {
+  for (var i = 0; i < enemies.length; i++) {
+    var e = enemies[i];
+    var screenX = e.x - camera.x;
+    var screenY = e.y - camera.y;
+
+    ctx.drawImage(
+      ASSETS["zmb_walker"],
+      screenX - CONFIG.WALKER_DRAW_SIZE / 2,
+      screenY - CONFIG.WALKER_DRAW_SIZE / 2,
+      CONFIG.WALKER_DRAW_SIZE,
+      CONFIG.WALKER_DRAW_SIZE
+    );
+  }
 }
 
 // Draws the soldier at its screen position (world pos minus camera),
