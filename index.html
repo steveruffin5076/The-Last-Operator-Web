@@ -41,7 +41,9 @@
   #hud,
   #overlay,
   #levelup-overlay,
-  #pause-overlay {
+  #pause-overlay,
+  #gameover-overlay,
+  #victory-overlay {
     position: absolute;
     inset: 0;
     width: 100%;
@@ -132,6 +134,30 @@
     font-size: 13px;
     font-weight: bold;
     text-shadow: 1px 1px 0 #000;
+  }
+
+  /* Boss WARNING banner: shows for a few seconds before the boss spawns.
+     Lives inside #hud so it doesn't pause/block anything -- purely cosmetic. */
+  #boss-warning {
+    position: absolute;
+    top: 40%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    font-size: 56px;
+    font-weight: bold;
+    color: #e33;
+    letter-spacing: 6px;
+    text-shadow: 3px 3px 0 #000;
+    animation: warning-pulse 0.4s infinite alternate;
+  }
+
+  #boss-warning.hidden {
+    display: none;
+  }
+
+  @keyframes warning-pulse {
+    from { opacity: 1; }
+    to { opacity: 0.35; }
   }
 
   /* ---- Overlay: covers the whole game area for title/pause/end screens ---- */
@@ -250,7 +276,8 @@
     text-shadow: 3px 3px 0 #000;
   }
 
-  #pause-overlay .menu-btn {
+  /* Shared button style for pause/game-over/victory overlays. */
+  .menu-btn {
     display: block;
     width: 180px;
     margin: 0 auto 14px auto;
@@ -265,9 +292,47 @@
     font-weight: bold;
   }
 
-  #pause-overlay .menu-btn:hover {
+  .menu-btn:hover {
     background: #23303a;
     border-color: #6fe3ff;
+  }
+
+  /* ---- Game Over / Victory overlays ---- */
+  #gameover-overlay,
+  #victory-overlay {
+    background: rgba(0, 0, 0, 0.85);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+  }
+
+  #gameover-overlay.hidden,
+  #victory-overlay.hidden {
+    display: none;
+  }
+
+  #gameover-overlay h1,
+  #victory-overlay h1 {
+    font-size: 48px;
+    margin: 0 0 16px 0;
+    letter-spacing: 2px;
+    text-shadow: 3px 3px 0 #000;
+  }
+
+  #gameover-overlay h1 {
+    color: #e33;
+  }
+
+  #victory-overlay h1 {
+    color: #3ecf5e;
+  }
+
+  #gameover-stats,
+  #victory-stats {
+    font-size: 18px;
+    margin: 0 0 28px 0;
   }
 </style>
 </head>
@@ -284,6 +349,7 @@
         <div id="hud-xp-wrap"><div id="hud-xp-bar"></div></div>
         <div id="hud-level">Lv 1</div>
         <div id="hud-hp-wrap"><div id="hud-hp-bar"></div><div id="hud-hp-text">100/100</div></div>
+        <div id="boss-warning" class="hidden">WARNING</div>
       </div>
 
       <!-- Overlay: title screen right now, reused later for pause/win/lose -->
@@ -319,6 +385,20 @@
         <h2>PAUSED</h2>
         <button class="menu-btn" id="resume-btn">Resume</button>
         <button class="menu-btn" id="restart-btn">Restart</button>
+      </div>
+
+      <!-- Game Over overlay: shown when player HP hits 0 -->
+      <div id="gameover-overlay" class="hidden">
+        <h1>KIA</h1>
+        <p id="gameover-stats"></p>
+        <button class="menu-btn" id="gameover-restart-btn">Restart [R]</button>
+      </div>
+
+      <!-- Victory overlay: shown when the boss dies -->
+      <div id="victory-overlay" class="hidden">
+        <h1>ZONE CLEARED!</h1>
+        <p id="victory-stats"></p>
+        <button class="menu-btn" id="victory-restart-btn">Restart [R]</button>
       </div>
     </div>
   </div>
