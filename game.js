@@ -56,14 +56,29 @@ var CONFIG = {
   BRUTE_MIN_START: 5, // brutes start spawning at Min 5
   BRUTE_SPAWN_INTERVAL: 6.0,
 
+  SHOOTER_HP: 60,
+  SHOOTER_TOUCH_DMG: 14,
+  SHOOTER_SPEED: 95,
+  SHOOTER_XP: 5,
+  SHOOTER_RADIUS: 13,
+  SHOOTER_DRAW_SIZE: 40,
+  SHOOTER_MIN_START: 7, // shooters start spawning at Min 7 (melee-only v1 -- ranged AI is Prompt 10)
+  SHOOTER_SPAWN_INTERVAL: 4.0,
+  SHOOTER_CAP: 8, // separate alive-cap just for shooters, on top of the overall cap
+
   SPAWN_RING_MIN: 720, // enemies spawn in a ring this far from the player...
   SPAWN_RING_MAX: 940, // ...so they never pop into view
   DESPAWN_DIST: 1300, // enemies this far away get removed (no XP refund)
 
-  // Alive cap ramps up as the run goes on (Min 0-2 / 2-5 / 5+ per wave table).
+  // Alive cap ramps up as the run goes on, per the wave table.
   CAP_MIN_0_2: 25,
   CAP_MIN_2_5: 50,
-  CAP_MIN_5_PLUS: 80,
+  CAP_MIN_5_7: 80,
+  CAP_MIN_7_9: 90,
+  CAP_MIN_9_10: 100,
+  RATE_MULT_MIN_9_10: 1.5, // Min 9-10: all spawn intervals divided by this
+
+  RUN_DURATION: 600, // 10:00 -- normal spawners stop here (boss lands in Prompt 7)
 
   SEPARATION_PUSH: 18, // max px two overlapping enemies get shoved apart per frame
 
@@ -193,11 +208,12 @@ var weapons = {
 // the drone is locked until a level-up pick unlocks it.
 var drones = [];
 
-// All enemies currently alive (walkers/runners/brutes), as plain objects.
+// All enemies currently alive (walkers/runners/brutes/shooters), as plain objects.
 var enemies = [];
 var walkerSpawnTimer = 0;
 var runnerSpawnTimer = 0;
 var bruteSpawnTimer = 0;
+var shooterSpawnTimer = 0;
 var perfLogTimer = 2; // logs enemy count to console every 2s (Prompt 2b perf check)
 
 // Bullets currently in flight (pistol tracers + shotgun pellets), as plain
@@ -400,6 +416,29 @@ function spawnBrute() {
   });
 }
 
+function spawnShooter() {
+  // v1 is melee-only (just chases like everything else) -- the
+  // aim/charge/shoot ranged AI is Prompt 10, behind USE_RANGED.
+  spawnEnemyInRing({
+    type: "shooter",
+    hp: CONFIG.SHOOTER_HP,
+    radius: CONFIG.SHOOTER_RADIUS,
+    speed: CONFIG.SHOOTER_SPEED,
+    touchDmg: CONFIG.SHOOTER_TOUCH_DMG,
+    xp: CONFIG.SHOOTER_XP,
+  });
+}
+
+// How many shooters are currently alive -- they have their own alive
+// cap (8) on top of the overall per-minute cap.
+function countShooters() {
+  var count = 0;
+  for (var i = 0; i < enemies.length; i++) {
+    if (enemies[i].type === "shooter") count++;
+  }
+  return count;
+}
+
 // Removes a dead enemy, counts the kill, and drops its gem. Shared by
 // every damage source (bullets, drone contact) so there's one place
 // that knows what happens when something dies.
@@ -424,9 +463,16 @@ function damageEnemyAt(index, e, amount) {
 // far. Widens in steps as the wave table calls for tougher minutes.
 function getAliveCap() {
   var elapsedMin = STATE.elapsed / 60;
-  if (elapsedMin >= 5) return CONFIG.CAP_MIN_5_PLUS;
+  if (elapsedMin >= 9) return CONFIG.CAP_MIN_9_10;
+  if (elapsedMin >= 7) return CONFIG.CAP_MIN_7_9;
+  if (elapsedMin >= 5) return CONFIG.CAP_MIN_5_7;
   if (elapsedMin >= 2) return CONFIG.CAP_MIN_2_5;
   return CONFIG.CAP_MIN_0_2;
+}
+
+// Min 9-10 spawns 1.5x faster (shorter intervals) per the wave table.
+function getSpawnRateMultiplier() {
+  return STATE.elapsed / 60 >= 9 ? CONFIG.RATE_MULT_MIN_9_10 : 1;
 }
 
 // Cheap pair separation: any two overlapping enemies get nudged
@@ -460,27 +506,42 @@ function applySeparation() {
 function updateEnemies(dt) {
   var cap = getAliveCap();
   var elapsedMin = STATE.elapsed / 60;
+  var rateMult = getSpawnRateMultiplier();
 
-  // --- spawners: walkers always run, runners/brutes unlock at their minute ---
-  walkerSpawnTimer -= dt;
-  if (walkerSpawnTimer <= 0) {
-    walkerSpawnTimer = CONFIG.SPAWN_INTERVAL;
-    if (enemies.length < cap) spawnWalker();
-  }
+  // 10:00: stop all normal spawning (the boss takes over from here in
+  // Prompt 7). Existing enemies keep fighting until the boss fight starts.
+  var stopNormals = STATE.elapsed >= CONFIG.RUN_DURATION;
 
-  if (elapsedMin >= CONFIG.RUNNER_MIN_START) {
-    runnerSpawnTimer -= dt;
-    if (runnerSpawnTimer <= 0) {
-      runnerSpawnTimer = CONFIG.RUNNER_SPAWN_INTERVAL;
-      if (enemies.length < cap) spawnRunner();
+  // --- spawners: walkers always run, others unlock at their minute ---
+  if (!stopNormals) {
+    walkerSpawnTimer -= dt;
+    if (walkerSpawnTimer <= 0) {
+      walkerSpawnTimer = CONFIG.SPAWN_INTERVAL / rateMult;
+      if (enemies.length < cap) spawnWalker();
     }
-  }
 
-  if (elapsedMin >= CONFIG.BRUTE_MIN_START) {
-    bruteSpawnTimer -= dt;
-    if (bruteSpawnTimer <= 0) {
-      bruteSpawnTimer = CONFIG.BRUTE_SPAWN_INTERVAL;
-      if (enemies.length < cap) spawnBrute();
+    if (elapsedMin >= CONFIG.RUNNER_MIN_START) {
+      runnerSpawnTimer -= dt;
+      if (runnerSpawnTimer <= 0) {
+        runnerSpawnTimer = CONFIG.RUNNER_SPAWN_INTERVAL / rateMult;
+        if (enemies.length < cap) spawnRunner();
+      }
+    }
+
+    if (elapsedMin >= CONFIG.BRUTE_MIN_START) {
+      bruteSpawnTimer -= dt;
+      if (bruteSpawnTimer <= 0) {
+        bruteSpawnTimer = CONFIG.BRUTE_SPAWN_INTERVAL / rateMult;
+        if (enemies.length < cap) spawnBrute();
+      }
+    }
+
+    if (elapsedMin >= CONFIG.SHOOTER_MIN_START) {
+      shooterSpawnTimer -= dt;
+      if (shooterSpawnTimer <= 0) {
+        shooterSpawnTimer = CONFIG.SHOOTER_SPAWN_INTERVAL / rateMult;
+        if (enemies.length < cap && countShooters() < CONFIG.SHOOTER_CAP) spawnShooter();
+      }
     }
   }
 
@@ -928,6 +989,7 @@ var hpTextEl = document.getElementById("hud-hp-text");
 var killsEl = document.getElementById("hud-kills");
 var xpBarEl = document.getElementById("hud-xp-bar");
 var levelEl = document.getElementById("hud-level");
+var timerEl = document.getElementById("hud-timer");
 
 function updateHud() {
   var pct = player.hp / player.hpMax;
@@ -937,6 +999,11 @@ function updateHud() {
   killsEl.textContent = "Kills: " + STATE.kills;
   xpBarEl.style.width = (player.xp / player.xpToNext) * 100 + "%";
   levelEl.textContent = "Lv " + player.level;
+
+  var remaining = Math.max(0, CONFIG.RUN_DURATION - STATE.elapsed);
+  var mm = Math.floor(remaining / 60);
+  var ss = Math.floor(remaining % 60);
+  timerEl.textContent = mm + ":" + (ss < 10 ? "0" : "") + ss;
 }
 
 function render() {
@@ -1014,6 +1081,7 @@ var ENEMY_VISUALS = {
   walker: { asset: "zmb_walker", size: CONFIG.WALKER_DRAW_SIZE },
   runner: { asset: "zmb_runner", size: CONFIG.RUNNER_DRAW_SIZE },
   brute: { asset: "zmb_brute", size: CONFIG.BRUTE_DRAW_SIZE },
+  shooter: { asset: "zmb_shooter", size: CONFIG.SHOOTER_DRAW_SIZE },
 };
 
 // Draws every enemy at its screen position (world pos minus camera).
