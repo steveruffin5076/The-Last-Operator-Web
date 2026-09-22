@@ -145,6 +145,18 @@ var CONFIG = {
   AIRSTRIKE_DMG: 80,
   AIRSTRIKE_SHAKE_AMOUNT: 14, // "big shake" -- more than the shotgun's 6px
 
+  // --- Juice Pack (Prompt 8) ---
+  HIT_FLASH_TIME: 0.08, // seconds an enemy stays bright white after being hit
+  MAX_DAMAGE_NUMBERS: 40, // hard cap so a huge fight can't spam unbounded text
+  HURT_VIGNETTE_TIME: 0.35, // seconds the red screen edge glow takes to fade after taking damage
+  PARTICLE_LIFE: 0.4,
+  PARTICLE_SPEED_MIN: 60,
+  PARTICLE_SPEED_MAX: 180,
+  PARTICLE_COUNT_PER_DEATH: 6,
+  MAX_PARTICLES: 250, // hard cap per game-design.md's performance rules
+  LEVELUP_FLASH_TIME: 0.5, // seconds the ring around the player takes to expand + fade
+  LEVELUP_RING_MAX_RADIUS: 90,
+
   BOSS_HP: 2500,
   BOSS_TOUCH_DMG: 30,
   BOSS_SPEED: 55,
@@ -258,6 +270,18 @@ var screenShake = 0;
 var gems = [];
 var gemComboCount = 0; // consecutive pickups -- for the pickup blip's rising pitch (Prompt 9)
 var gemComboTimer = 0; // combo resets once this hits 0
+
+// Death particle burst: small dots flying outward from a dead enemy,
+// as plain {x, y, vx, vy, life}. Hard-capped so a big fight can't
+// let this array grow forever.
+var particles = [];
+
+// Red screen-edge glow that flashes in when the player takes damage,
+// then fades back out. Counts down to 0 like the other cosmetic timers.
+var hurtVignetteTimer = 0;
+
+// Expanding ring drawn around the player on every level-up, purely cosmetic.
+var levelUpFlashTimer = 0;
 
 // -------------------------------------------------------------
 // SECTION: ASSET LOADER
@@ -463,6 +487,7 @@ function killEnemy(index, e) {
   enemies.splice(index, 1);
   STATE.kills++;
   spawnGem(e.x, e.y, e.xp);
+  spawnDeathParticles(e.x, e.y);
 
   if (e.type === "boss") {
     triggerVictory();
@@ -474,6 +499,7 @@ function killEnemy(index, e) {
 // they don't each re-implement "hit it, show a number, maybe kill it".
 function damageEnemyAt(index, e, amount) {
   e.hp -= amount;
+  e.hitFlash = CONFIG.HIT_FLASH_TIME; // brief white flash, drawn in drawEnemies()
   STATE.damageDealt += amount;
   spawnDamageNumber(e.x, e.y, amount);
   if (e.hp <= 0) {
@@ -600,6 +626,11 @@ function updateEnemies(dt) {
 
       e.x += moveX;
       e.y += moveY;
+    }
+
+    // Count down the hit-flash timer set by damageEnemyAt().
+    if (e.hitFlash > 0) {
+      e.hitFlash -= dt;
     }
 
     // Touch damage: only if close enough AND player isn't in i-frames.
@@ -815,9 +846,29 @@ function updatePistol(dt) {
   if (muzzleFlashTimer > 0) {
     muzzleFlashTimer -= dt;
   }
+}
 
-  // Shake settles back to 0 at a fixed rate regardless of how big it was.
+// Screen shake settles back to 0 at a fixed rate regardless of how big it
+// was -- shared by every shake source (pistol/shotgun fire, airstrike,
+// boss warning) since they all just raise `screenShake`, never set a timer.
+function updateShake(dt) {
   screenShake = Math.max(0, screenShake - CONFIG.SHAKE_DECAY_RATE * dt);
+}
+
+// Red screen-edge glow that flashes in on damagePlayer() and fades back out.
+function updateHurtVignette(dt) {
+  if (hurtVignetteTimer > 0) {
+    hurtVignetteTimer -= dt;
+  }
+  hurtVignetteEl.style.opacity = clamp(hurtVignetteTimer / CONFIG.HURT_VIGNETTE_TIME, 0, 1);
+}
+
+// Expanding ring around the player, triggered on every 'levelup' event.
+// Just counts down here -- drawLevelUpFlash() in RENDER does the drawing.
+function updateLevelUpFlash(dt) {
+  if (levelUpFlashTimer > 0) {
+    levelUpFlashTimer -= dt;
+  }
 }
 
 function spawnDamageNumber(x, y, value) {
@@ -827,6 +878,43 @@ function spawnDamageNumber(x, y, value) {
     value: value,
     life: CONFIG.DAMAGE_NUMBER_LIFE,
   });
+
+  // Hard cap: drop the oldest one so a big fight can't spam unbounded text.
+  if (damageNumbers.length > CONFIG.MAX_DAMAGE_NUMBERS) {
+    damageNumbers.shift();
+  }
+}
+
+// Small burst of dots flying outward from a dead enemy. Capped so a big
+// fight can't let this array grow forever -- oldest particles just get
+// replaced by new ones once the cap is hit.
+function spawnDeathParticles(x, y) {
+  for (var i = 0; i < CONFIG.PARTICLE_COUNT_PER_DEATH; i++) {
+    if (particles.length >= CONFIG.MAX_PARTICLES) {
+      particles.shift();
+    }
+    var angle = Math.random() * Math.PI * 2;
+    var speed = CONFIG.PARTICLE_SPEED_MIN + Math.random() * (CONFIG.PARTICLE_SPEED_MAX - CONFIG.PARTICLE_SPEED_MIN);
+    particles.push({
+      x: x,
+      y: y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      life: CONFIG.PARTICLE_LIFE,
+    });
+  }
+}
+
+function updateParticles(dt) {
+  for (var i = particles.length - 1; i >= 0; i--) {
+    var p = particles[i];
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.life -= dt;
+    if (p.life <= 0) {
+      particles.splice(i, 1);
+    }
+  }
 }
 
 function updateBullets(dt) {
@@ -1046,6 +1134,10 @@ function update(dt) {
   updateBullets(dt);
   updateDamageNumbers(dt);
   updateGems(dt);
+  updateParticles(dt);
+  updateShake(dt);
+  updateHurtVignette(dt);
+  updateLevelUpFlash(dt);
 
   if (player.hp <= 0) {
     triggerGameOver();
@@ -1065,6 +1157,8 @@ function damagePlayer(amount) {
   var reduced = Math.max(1, amount - player.armor);
   player.hp = clamp(player.hp - reduced, 0, player.hpMax);
   player.iframe = CONFIG.PLAYER_IFRAME_TIME;
+  hurtVignetteTimer = CONFIG.HURT_VIGNETTE_TIME; // red screen-edge flash
+  playSound("hurt");
 }
 
 // -------------------------------------------------------------
@@ -1083,6 +1177,7 @@ var killsEl = document.getElementById("hud-kills");
 var xpBarEl = document.getElementById("hud-xp-bar");
 var levelEl = document.getElementById("hud-level");
 var timerEl = document.getElementById("hud-timer");
+var hurtVignetteEl = document.getElementById("hurt-vignette");
 
 function updateHud() {
   var pct = player.hp / player.hpMax;
@@ -1118,10 +1213,12 @@ function render() {
 
     drawTiledBackground();
     drawGems();
+    drawParticles();
     drawEnemies();
     drawBossHealthBar();
     drawBullets();
     drawPlayer();
+    drawLevelUpFlash();
     drawDrones();
     drawMuzzleFlash();
     drawDamageNumbers();
@@ -1180,13 +1277,19 @@ var ENEMY_VISUALS = {
 };
 
 // Draws every enemy at its screen position (world pos minus camera).
-// No rotation, no shadows/filters -- keep it cheap with 80+ alive.
+// No rotation/shadows -- keep it cheap with 80+ alive. The one exception
+// is ctx.filter, only applied for the few frames an enemy is flashing
+// from a fresh hit (never fullscreen, per game-design.md's perf rules).
 function drawEnemies() {
   for (var i = 0; i < enemies.length; i++) {
     var e = enemies[i];
     var visual = ENEMY_VISUALS[e.type];
     var screenX = e.x - camera.x;
     var screenY = e.y - camera.y;
+
+    if (e.hitFlash > 0) {
+      ctx.filter = "brightness(2.5)";
+    }
 
     ctx.drawImage(
       ASSETS[visual.asset],
@@ -1195,7 +1298,45 @@ function drawEnemies() {
       visual.size,
       visual.size
     );
+
+    if (e.hitFlash > 0) {
+      ctx.filter = "none";
+    }
   }
+}
+
+// Small fading dots from a dead enemy's death burst.
+function drawParticles() {
+  for (var i = 0; i < particles.length; i++) {
+    var p = particles[i];
+    var screenX = p.x - camera.x;
+    var screenY = p.y - camera.y;
+
+    ctx.globalAlpha = clamp(p.life / CONFIG.PARTICLE_LIFE, 0, 1);
+    ctx.fillStyle = "#ddd";
+    ctx.beginPath();
+    ctx.arc(screenX, screenY, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+// Expanding cyan ring around the player, drawn on every level-up.
+function drawLevelUpFlash() {
+  if (levelUpFlashTimer <= 0) return;
+
+  var t = 1 - levelUpFlashTimer / CONFIG.LEVELUP_FLASH_TIME; // 0 -> 1 as it plays out
+  var radius = t * CONFIG.LEVELUP_RING_MAX_RADIUS;
+  var screenX = player.x - camera.x;
+  var screenY = player.y - camera.y;
+
+  ctx.globalAlpha = 1 - t;
+  ctx.strokeStyle = "#3dd6ff"; // same cyan as the XP bar
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.arc(screenX, screenY, radius, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
 }
 
 // Small red HP bar hovering above the boss, GDD's "boss mini HP bar".
@@ -1502,6 +1643,8 @@ var currentCards = []; // the (up to) 3 upgrades shown right now
 
 window.addEventListener("levelup", function () {
   pendingLevelUps++;
+  levelUpFlashTimer = CONFIG.LEVELUP_FLASH_TIME; // ring flash, every level regardless of chaining
+  playSound("levelup_arp");
   if (STATE.mode === "play") {
     showLevelUpPanel();
   }
@@ -1647,6 +1790,10 @@ function resetGame() {
 
   damageNumbers = [];
   screenShake = 0;
+  particles = [];
+  hurtVignetteTimer = 0;
+  hurtVignetteEl.style.opacity = 0;
+  levelUpFlashTimer = 0;
 
   gems = [];
   gemComboCount = 0;
