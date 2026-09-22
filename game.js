@@ -97,6 +97,13 @@ var CONFIG = {
 
   SHOTGUN_MUZZLE_FLASH_SIZE: 40, // "wide muzzle" -- bigger than the pistol's
   SHOTGUN_SHAKE_AMOUNT: 6, // "stronger shake" than the pistol's tiny 2px
+
+  DRONE_COUNT: 1,
+  DRONE_RADIUS: 95, // px from the player the drone orbits at
+  DRONE_ANGULAR_SPEED: 3.2, // rad/s
+  DRONE_DRAW_SIZE: 30,
+  DRONE_DMG: 18,
+  DRONE_HIT_COOLDOWN: 0.4, // seconds before the same enemy can be hit again
 };
 
 // -------------------------------------------------------------
@@ -125,6 +132,10 @@ var camera = {
   x: 0,
   y: 0,
 };
+
+// Orbit drones: each is just an angle around the player. DRONE_COUNT is
+// fixed at 1 for now (no upgrades yet), so this starts with one entry.
+var drones = [{ angle: 0 }];
 
 // All enemies currently alive (walkers/runners/brutes), as plain objects.
 var enemies = [];
@@ -283,6 +294,7 @@ function spawnEnemyInRing(props) {
 
   props.x = player.x + Math.cos(angle) * dist;
   props.y = player.y + Math.sin(angle) * dist;
+  props.droneHitCooldown = 0; // can be hit by the orbit drone right away
   enemies.push(props);
 }
 
@@ -638,6 +650,50 @@ function updateDamageNumbers(dt) {
   }
 }
 
+// World-space position of an orbiting drone, given its current angle.
+function droneWorldX(drone) {
+  return player.x + Math.cos(drone.angle) * CONFIG.DRONE_RADIUS;
+}
+function droneWorldY(drone) {
+  return player.y + Math.sin(drone.angle) * CONFIG.DRONE_RADIUS;
+}
+
+function updateDrones(dt) {
+  for (var i = 0; i < drones.length; i++) {
+    drones[i].angle += CONFIG.DRONE_ANGULAR_SPEED * dt;
+  }
+
+  // Loop backwards so splice() (an enemy dying) doesn't skip the next one.
+  for (var j = enemies.length - 1; j >= 0; j--) {
+    var e = enemies[j];
+
+    if (e.droneHitCooldown > 0) {
+      e.droneHitCooldown -= dt;
+      continue; // still cooling down from the last hit -- can't be hit again yet
+    }
+
+    for (var i = 0; i < drones.length; i++) {
+      var dx = droneWorldX(drones[i]) - e.x;
+      var dy = droneWorldY(drones[i]) - e.y;
+      var dist = Math.sqrt(dx * dx + dy * dy);
+      var contactDist = CONFIG.DRONE_DRAW_SIZE / 2 + e.radius;
+
+      if (dist < contactDist) {
+        e.hp -= CONFIG.DRONE_DMG;
+        spawnDamageNumber(e.x, e.y, CONFIG.DRONE_DMG);
+        e.droneHitCooldown = CONFIG.DRONE_HIT_COOLDOWN;
+
+        if (e.hp <= 0) {
+          enemies.splice(j, 1);
+          STATE.kills++;
+        }
+
+        break; // one drone's worth of damage per enemy per frame is enough
+      }
+    }
+  }
+}
+
 // -------------------------------------------------------------
 // SECTION: UPDATE (stub)
 // Game logic (movement, collisions, spawning...) goes here in
@@ -674,6 +730,7 @@ function update(dt) {
   updateEnemies(dt);
   updatePistol(dt);
   updateShotgun(dt);
+  updateDrones(dt);
   updateBullets(dt);
   updateDamageNumbers(dt);
   updateHud();
@@ -726,6 +783,7 @@ function render() {
     drawEnemies();
     drawBullets();
     drawPlayer();
+    drawDrones();
     drawMuzzleFlash();
     drawDamageNumbers();
 
@@ -799,6 +857,22 @@ function drawPlayer() {
     CONFIG.PLAYER_SPRITE_H
   );
   ctx.restore();
+}
+
+// Draws each orbit drone at its current position around the player.
+function drawDrones() {
+  for (var i = 0; i < drones.length; i++) {
+    var screenX = droneWorldX(drones[i]) - camera.x;
+    var screenY = droneWorldY(drones[i]) - camera.y;
+
+    ctx.drawImage(
+      ASSETS["wpn_drone"],
+      screenX - CONFIG.DRONE_DRAW_SIZE / 2,
+      screenY - CONFIG.DRONE_DRAW_SIZE / 2,
+      CONFIG.DRONE_DRAW_SIZE,
+      CONFIG.DRONE_DRAW_SIZE
+    );
+  }
 }
 
 // Yellow tracer per bullet: a soft glow circle behind a solid core,
