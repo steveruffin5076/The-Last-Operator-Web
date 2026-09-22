@@ -144,6 +144,17 @@ var CONFIG = {
   UPGRADE_REGEN_STEP: 0.8,
   AIRSTRIKE_DMG: 80,
   AIRSTRIKE_SHAKE_AMOUNT: 14, // "big shake" -- more than the shotgun's 6px
+
+  BOSS_HP: 2500,
+  BOSS_TOUCH_DMG: 30,
+  BOSS_SPEED: 55,
+  BOSS_RADIUS: 40,
+  BOSS_XP: 50,
+  BOSS_DRAW_SIZE: 130,
+  BOSS_WARNING_DURATION: 2.5, // seconds the WARNING banner shows before it spawns
+  BOSS_SUMMON_INTERVAL: 8.0, // seconds between the boss summoning walkers
+  BOSS_SUMMON_COUNT: 4,
+  BOSS_SHAKE_AMOUNT: 20, // biggest shake in the game, on boss spawn
 };
 
 // -------------------------------------------------------------
@@ -152,11 +163,17 @@ var CONFIG = {
 // it's easy to find/reset/debug.
 // -------------------------------------------------------------
 var STATE = {
-  mode: "title", // title -> play -> ... (more modes added in later prompts)
+  mode: "title", // title -> play -> pause/levelup -> gameover/victory
   lastTime: 0,   // timestamp of previous animation frame, for computing dt
   elapsed: 0,    // seconds spent in "play" mode -- drives spawn timing/caps
   kills: 0,
+  damageDealt: 0, // total dmg the player has dealt, shown on the Victory screen
 };
+
+// Boss state, separate from the enemies array's chase timer bookkeeping --
+// null until the WARNING banner finishes and spawnBoss() runs.
+var bossSpawned = false; // guards the WARNING sequence from firing twice
+var bossWarningTimer = 0; // counts down the WARNING banner before spawnBoss()
 
 // The player, dropped in the middle of the world to start.
 var player = {
@@ -446,6 +463,10 @@ function killEnemy(index, e) {
   enemies.splice(index, 1);
   STATE.kills++;
   spawnGem(e.x, e.y, e.xp);
+
+  if (e.type === "boss") {
+    triggerVictory();
+  }
 }
 
 // Applies damage + a floating number to one enemy, killing it if it drops
@@ -453,6 +474,7 @@ function killEnemy(index, e) {
 // they don't each re-implement "hit it, show a number, maybe kill it".
 function damageEnemyAt(index, e, amount) {
   e.hp -= amount;
+  STATE.damageDealt += amount;
   spawnDamageNumber(e.x, e.y, amount);
   if (e.hp <= 0) {
     killEnemy(index, e);
@@ -595,6 +617,71 @@ function updateEnemies(dt) {
   if (perfLogTimer <= 0) {
     perfLogTimer = 2;
     console.log("enemies alive:", enemies.length, "/ cap:", cap, "| elapsed:", STATE.elapsed.toFixed(1) + "s");
+  }
+}
+
+// -------------------------------------------------------------
+// SECTION: BOSS
+// The Warlord is pushed into the same `enemies` array as everything
+// else, with type "boss" -- so it gets chase movement, touch damage,
+// bullet/drone hits, and death-handling completely for free from the
+// generic loops above. This section only adds what's actually special
+// about it: the WARNING countdown before it appears, and its walker
+// summon timer.
+// -------------------------------------------------------------
+
+function findBoss() {
+  for (var i = 0; i < enemies.length; i++) {
+    if (enemies[i].type === "boss") return enemies[i];
+  }
+  return null;
+}
+
+function spawnBoss() {
+  spawnEnemyInRing({
+    type: "boss",
+    hp: CONFIG.BOSS_HP,
+    radius: CONFIG.BOSS_RADIUS,
+    speed: CONFIG.BOSS_SPEED,
+    touchDmg: CONFIG.BOSS_TOUCH_DMG,
+    xp: CONFIG.BOSS_XP,
+    summonTimer: CONFIG.BOSS_SUMMON_INTERVAL,
+  });
+}
+
+function startBossWarning() {
+  bossWarningTimer = CONFIG.BOSS_WARNING_DURATION;
+  screenShake = Math.max(screenShake, CONFIG.BOSS_SHAKE_AMOUNT);
+  playSound("boss_roar");
+  bossWarningEl.classList.remove("hidden");
+}
+
+function updateBoss(dt) {
+  // 10:00 hits -> start the one-time WARNING sequence.
+  if (!bossSpawned && bossWarningTimer <= 0 && STATE.elapsed >= CONFIG.RUN_DURATION) {
+    bossSpawned = true;
+    startBossWarning();
+  }
+
+  if (bossWarningTimer > 0) {
+    bossWarningTimer -= dt;
+    if (bossWarningTimer <= 0) {
+      bossWarningEl.classList.add("hidden");
+      spawnBoss();
+    }
+  }
+
+  // Summon 4 walkers every 8s once the boss exists (its movement/touch
+  // damage/death are already handled by the generic enemy loops).
+  var boss = findBoss();
+  if (boss) {
+    boss.summonTimer -= dt;
+    if (boss.summonTimer <= 0) {
+      boss.summonTimer = CONFIG.BOSS_SUMMON_INTERVAL;
+      for (var i = 0; i < CONFIG.BOSS_SUMMON_COUNT; i++) {
+        spawnWalker();
+      }
+    }
   }
 }
 
@@ -952,12 +1039,18 @@ function update(dt) {
   camera.y = clamp(player.y - CONFIG.CANVAS_H / 2, 0, CONFIG.WORLD_H - CONFIG.CANVAS_H);
 
   updateEnemies(dt);
+  updateBoss(dt);
   updatePistol(dt);
   updateShotgun(dt);
   updateDrones(dt);
   updateBullets(dt);
   updateDamageNumbers(dt);
   updateGems(dt);
+
+  if (player.hp <= 0) {
+    triggerGameOver();
+  }
+
   updateHud();
 }
 
@@ -1026,6 +1119,7 @@ function render() {
     drawTiledBackground();
     drawGems();
     drawEnemies();
+    drawBossHealthBar();
     drawBullets();
     drawPlayer();
     drawDrones();
@@ -1082,6 +1176,7 @@ var ENEMY_VISUALS = {
   runner: { asset: "zmb_runner", size: CONFIG.RUNNER_DRAW_SIZE },
   brute: { asset: "zmb_brute", size: CONFIG.BRUTE_DRAW_SIZE },
   shooter: { asset: "zmb_shooter", size: CONFIG.SHOOTER_DRAW_SIZE },
+  boss: { asset: "boss_warlord", size: CONFIG.BOSS_DRAW_SIZE },
 };
 
 // Draws every enemy at its screen position (world pos minus camera).
@@ -1101,6 +1196,23 @@ function drawEnemies() {
       visual.size
     );
   }
+}
+
+// Small red HP bar hovering above the boss, GDD's "boss mini HP bar".
+function drawBossHealthBar() {
+  var boss = findBoss();
+  if (!boss) return;
+
+  var screenX = boss.x - camera.x;
+  var screenY = boss.y - camera.y - CONFIG.BOSS_DRAW_SIZE / 2 - 16;
+  var barWidth = 120;
+  var barHeight = 10;
+  var pct = clamp(boss.hp / CONFIG.BOSS_HP, 0, 1);
+
+  ctx.fillStyle = "#222";
+  ctx.fillRect(screenX - barWidth / 2, screenY, barWidth, barHeight);
+  ctx.fillStyle = "#e33";
+  ctx.fillRect(screenX - barWidth / 2, screenY, barWidth * pct, barHeight);
 }
 
 // Draws the soldier at its screen position (world pos minus camera),
@@ -1487,6 +1599,11 @@ function resumeGame() {
 function resetGame() {
   STATE.elapsed = 0;
   STATE.kills = 0;
+  STATE.damageDealt = 0;
+
+  bossSpawned = false;
+  bossWarningTimer = 0;
+  bossWarningEl.classList.add("hidden");
 
   player.x = CONFIG.WORLD_W / 2;
   player.y = CONFIG.WORLD_H / 2;
@@ -1540,6 +1657,8 @@ function resetGame() {
   levelupOverlayEl.classList.add("hidden");
 
   pauseOverlayEl.classList.add("hidden");
+  gameoverOverlayEl.classList.add("hidden");
+  victoryOverlayEl.classList.add("hidden");
   STATE.mode = "play";
 }
 
@@ -1550,6 +1669,60 @@ window.addEventListener("keydown", function (e) {
   if (e.key !== "Escape") return;
   if (STATE.mode === "play") pauseGame();
   else if (STATE.mode === "pause") resumeGame();
+});
+
+// -------------------------------------------------------------
+// SECTION: END SCREENS
+// HP0 = Game Over ("KIA"), boss killed = Victory ("ZONE CLEARED!").
+// Both show time/kills/level (Victory adds damage dealt) and offer
+// Restart via button or the R key.
+// -------------------------------------------------------------
+var bossWarningEl = document.getElementById("boss-warning");
+
+var gameoverOverlayEl = document.getElementById("gameover-overlay");
+var gameoverStatsEl = document.getElementById("gameover-stats");
+var gameoverRestartBtn = document.getElementById("gameover-restart-btn");
+
+var victoryOverlayEl = document.getElementById("victory-overlay");
+var victoryStatsEl = document.getElementById("victory-stats");
+var victoryRestartBtn = document.getElementById("victory-restart-btn");
+
+// Same MM:SS format as the HUD timer, just for a fixed elapsed value.
+function formatTime(seconds) {
+  var mm = Math.floor(seconds / 60);
+  var ss = Math.floor(seconds % 60);
+  return mm + ":" + (ss < 10 ? "0" : "") + ss;
+}
+
+function triggerGameOver() {
+  if (STATE.mode !== "play") return; // don't double-trigger
+  STATE.mode = "gameover";
+  gameoverStatsEl.textContent =
+    "Time: " + formatTime(STATE.elapsed) + "   Kills: " + STATE.kills + "   Level: " + player.level;
+  gameoverOverlayEl.classList.remove("hidden");
+}
+
+function triggerVictory() {
+  STATE.mode = "victory";
+  victoryStatsEl.textContent =
+    "Time: " + formatTime(STATE.elapsed) + "   Kills: " + STATE.kills + "   Level: " + player.level +
+    "   Damage Dealt: " + STATE.damageDealt;
+  victoryOverlayEl.classList.remove("hidden");
+}
+
+function restartFromEndScreen() {
+  gameoverOverlayEl.classList.add("hidden");
+  victoryOverlayEl.classList.add("hidden");
+  resetGame();
+}
+
+gameoverRestartBtn.addEventListener("click", restartFromEndScreen);
+victoryRestartBtn.addEventListener("click", restartFromEndScreen);
+
+window.addEventListener("keydown", function (e) {
+  if ((STATE.mode === "gameover" || STATE.mode === "victory") && e.key.toLowerCase() === "r") {
+    restartFromEndScreen();
+  }
 });
 
 // -------------------------------------------------------------
