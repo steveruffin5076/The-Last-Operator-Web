@@ -464,9 +464,19 @@ function firePistol(target) {
 }
 
 function updatePistol(dt) {
+  var target = findNearestEnemy(CONFIG.PISTOL_RANGE);
+
+  // Face whatever we're about to shoot -- otherwise the soldier keeps
+  // facing its last move direction while bullets fly out sideways,
+  // which looks like the gun isn't aiming at anything.
+  if (target) {
+    var tdx = target.x - player.x;
+    var tdy = target.y - player.y;
+    player.angle = Math.atan2(tdx, -tdy); // same "art faces UP" convention as movement
+  }
+
   pistolCooldown -= dt;
   if (pistolCooldown <= 0) {
-    var target = findNearestEnemy(CONFIG.PISTOL_RANGE);
     if (target) {
       firePistol(target);
       pistolCooldown = CONFIG.PISTOL_FIRE_INTERVAL;
