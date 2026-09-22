@@ -104,6 +104,14 @@ var CONFIG = {
   DRONE_DRAW_SIZE: 30,
   DRONE_DMG: 18,
   DRONE_HIT_COOLDOWN: 0.4, // seconds before the same enemy can be hit again
+
+  GEM_CHASE_SPEED: 430, // px/sec once a gem is within the magnet radius
+  GEM_COLLECT_DIST: 22, // px -- closer than this and it's picked up
+  GEM_DRAW_SIZE: 14,
+  GEM_COMBO_WINDOW: 0.5, // seconds since the last pickup before the combo resets
+
+  XP_BASE: 8, // XP needed for Lv1 -> Lv2
+  XP_PER_LEVEL: 9, // extra XP needed per level after that (need = 8 + (level-1)*9)
 };
 
 // -------------------------------------------------------------
@@ -125,6 +133,9 @@ var player = {
   hp: CONFIG.PLAYER_HP_MAX,
   angle: 0, // radians, which way the sprite is rotated to face
   iframe: 0, // seconds left of "can't be hit again" after taking damage
+  level: 1,
+  xp: 0,
+  xpToNext: CONFIG.XP_BASE, // recomputed via xpNeededForLevel() on every level-up
 };
 
 // Camera = top-left corner of the view into the world, in world pixels.
@@ -164,6 +175,11 @@ var muzzleFlashAngle = 0;
 
 // Tiny screen shake magnitude (px), decays back to 0 every frame.
 var screenShake = 0;
+
+// Gems dropped by dead enemies, as plain {x, y, value, color}.
+var gems = [];
+var gemComboCount = 0; // consecutive pickups -- for the pickup blip's rising pitch (Prompt 9)
+var gemComboTimer = 0; // combo resets once this hits 0
 
 // -------------------------------------------------------------
 // SECTION: ASSET LOADER
@@ -305,6 +321,7 @@ function spawnWalker() {
     radius: CONFIG.WALKER_RADIUS,
     speed: CONFIG.WALKER_SPEED,
     touchDmg: CONFIG.WALKER_TOUCH_DMG,
+    xp: CONFIG.WALKER_XP,
   });
 }
 
@@ -315,6 +332,7 @@ function spawnRunner() {
     radius: CONFIG.RUNNER_RADIUS,
     speed: CONFIG.RUNNER_SPEED,
     touchDmg: CONFIG.RUNNER_TOUCH_DMG,
+    xp: CONFIG.RUNNER_XP,
     phase: Math.random() * Math.PI * 2, // offsets the wiggle so runners don't all sway in sync
   });
 }
@@ -328,7 +346,17 @@ function spawnBrute() {
     radius: CONFIG.BRUTE_RADIUS,
     speed: CONFIG.BRUTE_SPEED,
     touchDmg: CONFIG.BRUTE_TOUCH_DMG,
+    xp: CONFIG.BRUTE_XP,
   });
+}
+
+// Removes a dead enemy, counts the kill, and drops its gem. Shared by
+// every damage source (bullets, drone contact) so there's one place
+// that knows what happens when something dies.
+function killEnemy(index, e) {
+  enemies.splice(index, 1);
+  STATE.kills++;
+  spawnGem(e.x, e.y, e.xp);
 }
 
 // How many enemies are allowed alive at once, based on run time so
@@ -623,8 +651,7 @@ function updateBullets(dt) {
           }
 
           if (e.hp <= 0) {
-            enemies.splice(j, 1);
-            STATE.kills++;
+            killEnemy(j, e);
           }
 
           hitSomething = true;
@@ -684,12 +711,88 @@ function updateDrones(dt) {
         e.droneHitCooldown = CONFIG.DRONE_HIT_COOLDOWN;
 
         if (e.hp <= 0) {
-          enemies.splice(j, 1);
-          STATE.kills++;
+          killEnemy(j, e);
         }
 
         break; // one drone's worth of damage per enemy per frame is enough
       }
+    }
+  }
+}
+
+// -------------------------------------------------------------
+// SECTION: GEMS + XP
+// Dead enemies drop a gem; gems within magnet range fly to the
+// player and grant XP on pickup. Leveling up follows a simple
+// curve and fires a DOM 'levelup' event so later prompts (the
+// level-up card UI) can hook in without touching this code.
+// -------------------------------------------------------------
+
+// Picks the gem sprite color for a given XP value (GDD: 1 green,
+// 2-5 blue, 8+ gold -- which lines up exactly with walker/runner/brute).
+function gemColorForValue(value) {
+  if (value >= 8) return "gold";
+  if (value >= 2) return "blue";
+  return "green";
+}
+
+function spawnGem(x, y, value) {
+  gems.push({
+    x: x,
+    y: y,
+    value: value,
+    color: gemColorForValue(value),
+  });
+}
+
+// XP required to go from `level` to `level + 1`.
+function xpNeededForLevel(level) {
+  return CONFIG.XP_BASE + (level - 1) * CONFIG.XP_PER_LEVEL;
+}
+
+function collectGem(g) {
+  player.xp += g.value;
+
+  // A while loop (not if) in case one big gem crosses more than one
+  // level threshold at once.
+  while (player.xp >= player.xpToNext) {
+    player.xp -= player.xpToNext;
+    player.level++;
+    player.xpToNext = xpNeededForLevel(player.level);
+    window.dispatchEvent(new CustomEvent("levelup", { detail: { level: player.level } }));
+  }
+
+  // Combo tracking for the pickup blip's rising pitch -- audible once
+  // Prompt 9 wires up real WebAudio; playSound() is a no-op until then.
+  gemComboTimer = CONFIG.GEM_COMBO_WINDOW;
+  gemComboCount++;
+  playSound("gem_pickup");
+}
+
+function updateGems(dt) {
+  // Combo resets after a short gap with no pickups.
+  if (gemComboTimer > 0) {
+    gemComboTimer -= dt;
+    if (gemComboTimer <= 0) {
+      gemComboCount = 0;
+    }
+  }
+
+  for (var i = gems.length - 1; i >= 0; i--) {
+    var g = gems[i];
+    var dx = player.x - g.x;
+    var dy = player.y - g.y;
+    var dist = Math.sqrt(dx * dx + dy * dy);
+
+    if (dist < CONFIG.GEM_COLLECT_DIST) {
+      collectGem(g);
+      gems.splice(i, 1);
+      continue;
+    }
+
+    if (dist < CONFIG.PLAYER_MAGNET && dist > 0) {
+      g.x += (dx / dist) * CONFIG.GEM_CHASE_SPEED * dt;
+      g.y += (dy / dist) * CONFIG.GEM_CHASE_SPEED * dt;
     }
   }
 }
@@ -733,6 +836,7 @@ function update(dt) {
   updateDrones(dt);
   updateBullets(dt);
   updateDamageNumbers(dt);
+  updateGems(dt);
   updateHud();
 }
 
@@ -753,6 +857,8 @@ var bgPattern = null; // built once bg_asphalt.png has loaded
 var hpBarEl = document.getElementById("hud-hp-bar");
 var hpTextEl = document.getElementById("hud-hp-text");
 var killsEl = document.getElementById("hud-kills");
+var xpBarEl = document.getElementById("hud-xp-bar");
+var levelEl = document.getElementById("hud-level");
 
 function updateHud() {
   var pct = player.hp / CONFIG.PLAYER_HP_MAX;
@@ -760,6 +866,8 @@ function updateHud() {
   hpBarEl.style.background = pct < 0.3 ? "#e33" : "#3ecf5e"; // red warning when low
   hpTextEl.textContent = Math.ceil(player.hp) + "/" + CONFIG.PLAYER_HP_MAX;
   killsEl.textContent = "Kills: " + STATE.kills;
+  xpBarEl.style.width = (player.xp / player.xpToNext) * 100 + "%";
+  levelEl.textContent = "Lv " + player.level;
 }
 
 function render() {
@@ -780,6 +888,7 @@ function render() {
     }
 
     drawTiledBackground();
+    drawGems();
     drawEnemies();
     drawBullets();
     drawPlayer();
@@ -812,6 +921,23 @@ function drawTiledBackground() {
   // Fill exactly the area the camera can see (in world space).
   ctx.fillRect(camera.x, camera.y, CONFIG.CANVAS_W, CONFIG.CANVAS_H);
   ctx.restore();
+}
+
+// Draws every gem at its screen position (world pos minus camera).
+function drawGems() {
+  for (var i = 0; i < gems.length; i++) {
+    var g = gems[i];
+    var screenX = g.x - camera.x;
+    var screenY = g.y - camera.y;
+
+    ctx.drawImage(
+      ASSETS["gem_" + g.color],
+      screenX - CONFIG.GEM_DRAW_SIZE / 2,
+      screenY - CONFIG.GEM_DRAW_SIZE / 2,
+      CONFIG.GEM_DRAW_SIZE,
+      CONFIG.GEM_DRAW_SIZE
+    );
+  }
 }
 
 // Which sprite + draw size to use per enemy type.
