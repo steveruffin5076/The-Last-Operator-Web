@@ -64,7 +64,27 @@ var CONFIG = {
   SHOOTER_DRAW_SIZE: 40,
   SHOOTER_MIN_START: 7, // shooters start spawning at Min 7 (melee-only v1 -- ranged AI is Prompt 10)
   SHOOTER_SPAWN_INTERVAL: 4.0,
-  SHOOTER_CAP: 8, // separate alive-cap just for shooters, on top of the overall cap
+  SHOOTER_CAP: 8, // separate alive-cap just for shooters, on top of the overall cap (v1 melee)
+
+  // --- v2 Shooter Ranged AI (Prompt 10, behind USE_RANGED below) ---
+  SHOOTER_CAP_RANGED: 6, // lower alive-cap once they can shoot -- more dangerous per-unit
+  SHOOTER_RANGED_ENGAGE_DIST: 350, // CHASE stops and AIM starts once this close
+  SHOOTER_AIM_TIME: 0.8,
+  SHOOTER_RELOAD_TIME: 2.8,
+  SHOOTER_BULLET_SPEED: 200,
+  SHOOTER_BULLET_DMG: 12,
+  SHOOTER_BULLET_RADIUS: 6,
+  SHOOTER_BULLET_LIFE: 3.0, // well past max range at this speed, in case it never reaches the player
+
+  ENEMY_BULLET_CAP: 30, // shared hard cap on shooter + boss projectiles alive at once ("pooled 30")
+
+  BOSS_SPREAD_INTERVAL: 3.0,
+  BOSS_SPREAD_COUNT: 5,
+  BOSS_SPREAD_CONE_DEG: 50, // keeps adjacent bullet gaps > 60px at a ~350px engagement range
+  BOSS_SPREAD_BULLET_DMG: 15,
+  BOSS_SPREAD_BULLET_SPEED: 200,
+  BOSS_SPREAD_BULLET_RADIUS: 6,
+  BOSS_SPREAD_BULLET_LIFE: 3.0,
 
   SPAWN_RING_MIN: 720, // enemies spawn in a ring this far from the player...
   SPAWN_RING_MAX: 940, // ...so they never pop into view
@@ -172,6 +192,10 @@ var CONFIG = {
   BOSS_SHAKE_AMOUNT: 20, // biggest shake in the game, on boss spawn
 };
 
+// Prompt 10's "AFTER v1 published ONLY" flag. Flip to false to instantly
+// revert every shooter (and the boss's spread attack) back to pure melee.
+const USE_RANGED = true;
+
 // -------------------------------------------------------------
 // SECTION: STATE
 // All the "current situation" data lives here. One object so
@@ -253,6 +277,11 @@ var perfLogTimer = 2; // logs enemy count to console every 2s (Prompt 2b perf ch
 var bullets = [];
 var pistolCooldown = 0; // counts down to the next shot
 var shotgunCooldown = 0;
+
+// Enemy-fired projectiles (v2 shooters + boss spread, Prompt 10), aimed
+// at the player instead of at enemies. Same {x,y,vx,vy,life,dmg,radius}
+// shape as `bullets` above, plus `core`/`glow` draw colors.
+var enemyBullets = [];
 
 // Muzzle flash size varies per weapon (shotgun's is "wide"), set at fire time.
 var muzzleFlashSize = CONFIG.MUZZLE_FLASH_SIZE;
@@ -492,6 +521,19 @@ function playSound(name) {
         tone(90, 40, 0.6, "sawtooth", 1);
         break;
 
+      case "shooter_charge":
+        // Rising whine roughly matching the 0.8s AIM duration.
+        tone(300, 900, 0.75, "sine", 0.5);
+        break;
+
+      case "shooter_shoot":
+        tone(700, 300, 0.08, "square", 0.7);
+        break;
+
+      case "boss_spread":
+        tone(150, 400, 0.3, "sawtooth", 0.9);
+        break;
+
       case "win_jingle":
         // Rising 4-note fanfare: C5, E5, G5, C6.
         tone(523, 523, 0.12, "square", 0.9);
@@ -575,8 +617,6 @@ function spawnBrute() {
 }
 
 function spawnShooter() {
-  // v1 is melee-only (just chases like everything else) -- the
-  // aim/charge/shoot ranged AI is Prompt 10, behind USE_RANGED.
   spawnEnemyInRing({
     type: "shooter",
     hp: CONFIG.SHOOTER_HP,
@@ -584,6 +624,9 @@ function spawnShooter() {
     speed: CONFIG.SHOOTER_SPEED,
     touchDmg: CONFIG.SHOOTER_TOUCH_DMG,
     xp: CONFIG.SHOOTER_XP,
+    // v2 ranged AI state machine (Prompt 10) -- ignored while USE_RANGED is false.
+    rangedState: "chase",
+    rangedTimer: 0,
   });
 }
 
@@ -706,7 +749,8 @@ function updateEnemies(dt) {
       shooterSpawnTimer -= dt;
       if (shooterSpawnTimer <= 0) {
         shooterSpawnTimer = CONFIG.SHOOTER_SPAWN_INTERVAL / rateMult;
-        if (enemies.length < cap && countShooters() < CONFIG.SHOOTER_CAP) spawnShooter();
+        var shooterCap = USE_RANGED ? CONFIG.SHOOTER_CAP_RANGED : CONFIG.SHOOTER_CAP;
+        if (enemies.length < cap && countShooters() < shooterCap) spawnShooter();
       }
     }
   }
@@ -726,8 +770,12 @@ function updateEnemies(dt) {
       continue;
     }
 
+    // A v2 shooter that's aiming or reloading plants its feet instead of
+    // walking -- it only chases while its state machine says "chase".
+    var isHoldingGround = USE_RANGED && e.type === "shooter" && e.rangedState !== "chase";
+
     // Walk straight toward the player.
-    if (dist > 0) {
+    if (dist > 0 && !isHoldingGround) {
       var dirX = dx / dist;
       var dirY = dy / dist;
       var moveX = dirX * e.speed * dt;
@@ -744,6 +792,10 @@ function updateEnemies(dt) {
 
       e.x += moveX;
       e.y += moveY;
+    }
+
+    if (USE_RANGED && e.type === "shooter") {
+      updateShooterAI(e, dt, dist);
     }
 
     // Count down the hit-flash timer set by damageEnemyAt().
@@ -770,13 +822,108 @@ function updateEnemies(dt) {
 }
 
 // -------------------------------------------------------------
+// SECTION: SHOOTER RANGED AI (v2, Prompt 10)
+// Only runs while USE_RANGED is true. State machine per shooter:
+// CHASE (handled by the normal movement code above) -> AIM 0.8s
+// (stands still, red laser telegraph) -> fires one bullet -> RELOAD
+// 2.8s (still standing still) -> back to CHASE.
+// -------------------------------------------------------------
+
+// Adds a projectile to the shared enemy-bullet pool, trimming the
+// oldest one if it's already at the hard cap ("pooled 30").
+function spawnEnemyBullet(props) {
+  enemyBullets.push(props);
+  if (enemyBullets.length > CONFIG.ENEMY_BULLET_CAP) {
+    enemyBullets.shift();
+  }
+}
+
+function fireShooterBullet(e) {
+  var dx = player.x - e.x;
+  var dy = player.y - e.y;
+  var dist = Math.sqrt(dx * dx + dy * dy) || 1; // avoid divide-by-zero
+  var dirX = dx / dist;
+  var dirY = dy / dist;
+
+  spawnEnemyBullet({
+    x: e.x,
+    y: e.y,
+    vx: dirX * CONFIG.SHOOTER_BULLET_SPEED,
+    vy: dirY * CONFIG.SHOOTER_BULLET_SPEED,
+    life: CONFIG.SHOOTER_BULLET_LIFE,
+    dmg: CONFIG.SHOOTER_BULLET_DMG,
+    radius: CONFIG.SHOOTER_BULLET_RADIUS,
+    core: "#2ecc40", // green bullet, per the GDD
+    glow: "#8affa0",
+  });
+  playSound("shooter_shoot");
+}
+
+// Advances one shooter's CHASE -> AIM -> RELOAD state machine. Movement
+// itself is handled by the shared enemy loop in updateEnemies() (it just
+// checks isHoldingGround there) -- this only manages the timers + firing.
+function updateShooterAI(e, dt, dist) {
+  if (e.rangedState === "chase") {
+    if (dist <= CONFIG.SHOOTER_RANGED_ENGAGE_DIST) {
+      e.rangedState = "aim";
+      e.rangedTimer = CONFIG.SHOOTER_AIM_TIME;
+      playSound("shooter_charge");
+    }
+    return;
+  }
+
+  if (e.rangedState === "aim") {
+    e.rangedTimer -= dt;
+    if (e.rangedTimer <= 0) {
+      fireShooterBullet(e);
+      e.rangedState = "reload";
+      e.rangedTimer = CONFIG.SHOOTER_RELOAD_TIME;
+    }
+    return;
+  }
+
+  // "reload"
+  e.rangedTimer -= dt;
+  if (e.rangedTimer <= 0) {
+    e.rangedState = "chase";
+  }
+}
+
+function updateEnemyBullets(dt) {
+  for (var i = enemyBullets.length - 1; i >= 0; i--) {
+    var b = enemyBullets[i];
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    b.life -= dt;
+
+    var dx = player.x - b.x;
+    var dy = player.y - b.y;
+    var dist = Math.sqrt(dx * dx + dy * dy);
+    var hitPlayer = false;
+
+    if (dist < CONFIG.PLAYER_RADIUS + b.radius) {
+      // Still consumes the bullet during i-frames -- it just deals no
+      // damage, same "respect iframes" rule as every other damage source.
+      if (player.iframe <= 0) {
+        damagePlayer(b.dmg);
+      }
+      hitPlayer = true;
+    }
+
+    if (hitPlayer || b.life <= 0) {
+      enemyBullets.splice(i, 1);
+    }
+  }
+}
+
+// -------------------------------------------------------------
 // SECTION: BOSS
 // The Warlord is pushed into the same `enemies` array as everything
 // else, with type "boss" -- so it gets chase movement, touch damage,
 // bullet/drone hits, and death-handling completely for free from the
 // generic loops above. This section only adds what's actually special
-// about it: the WARNING countdown before it appears, and its walker
-// summon timer.
+// about it: the WARNING countdown before it appears, its walker summon
+// timer, and (v2, Prompt 10) a 5-bullet spread attack every 3s.
 // -------------------------------------------------------------
 
 function findBoss() {
@@ -795,7 +942,38 @@ function spawnBoss() {
     touchDmg: CONFIG.BOSS_TOUCH_DMG,
     xp: CONFIG.BOSS_XP,
     summonTimer: CONFIG.BOSS_SUMMON_INTERVAL,
+    spreadTimer: CONFIG.BOSS_SPREAD_INTERVAL, // ignored while USE_RANGED is false
   });
+}
+
+// 5 bullets fanned out around the direction to the player, evenly spaced
+// across a cone -- same "spread the count across an arc" trick as the
+// shotgun's pellets, just aimed outward from the boss instead.
+function fireBossSpread(boss) {
+  var dx = player.x - boss.x;
+  var dy = player.y - boss.y;
+  var dist = Math.sqrt(dx * dx + dy * dy) || 1;
+  var baseAngle = Math.atan2(dy, dx);
+  var coneRad = (CONFIG.BOSS_SPREAD_CONE_DEG * Math.PI) / 180;
+  var count = CONFIG.BOSS_SPREAD_COUNT;
+  var step = count > 1 ? coneRad / (count - 1) : 0;
+  var startAngle = baseAngle - coneRad / 2;
+
+  for (var i = 0; i < count; i++) {
+    var angle = startAngle + step * i;
+    spawnEnemyBullet({
+      x: boss.x,
+      y: boss.y,
+      vx: Math.cos(angle) * CONFIG.BOSS_SPREAD_BULLET_SPEED,
+      vy: Math.sin(angle) * CONFIG.BOSS_SPREAD_BULLET_SPEED,
+      life: CONFIG.BOSS_SPREAD_BULLET_LIFE,
+      dmg: CONFIG.BOSS_SPREAD_BULLET_DMG,
+      radius: CONFIG.BOSS_SPREAD_BULLET_RADIUS,
+      core: "#ff5c1a",
+      glow: "#ff8a3d",
+    });
+  }
+  playSound("boss_spread");
 }
 
 function startBossWarning() {
@@ -829,6 +1007,15 @@ function updateBoss(dt) {
       boss.summonTimer = CONFIG.BOSS_SUMMON_INTERVAL;
       for (var i = 0; i < CONFIG.BOSS_SUMMON_COUNT; i++) {
         spawnWalker();
+      }
+    }
+
+    // v2: a 5-bullet spread every 3s, on top of the walker summons above.
+    if (USE_RANGED) {
+      boss.spreadTimer -= dt;
+      if (boss.spreadTimer <= 0) {
+        boss.spreadTimer = CONFIG.BOSS_SPREAD_INTERVAL;
+        fireBossSpread(boss);
       }
     }
   }
@@ -1250,6 +1437,7 @@ function update(dt) {
   updateShotgun(dt);
   updateDrones(dt);
   updateBullets(dt);
+  updateEnemyBullets(dt);
   updateDamageNumbers(dt);
   updateGems(dt);
   updateParticles(dt);
@@ -1337,8 +1525,10 @@ function render() {
     drawGems();
     drawParticles();
     drawEnemies();
+    drawShooterLasers();
     drawBossHealthBar();
     drawBullets();
+    drawEnemyBullets();
     drawPlayer();
     drawLevelUpFlash();
     drawDrones();
@@ -1533,6 +1723,52 @@ function drawBullets() {
     ctx.arc(screenX, screenY, b.radius, 0, Math.PI * 2);
     ctx.fill();
   }
+}
+
+// Enemy-fired projectiles (v2 shooters + boss spread, Prompt 10). Same
+// glow-behind-core look as drawBullets(), just colored per-bullet (green
+// for shooters, orange for the boss) instead of one fixed color.
+function drawEnemyBullets() {
+  for (var i = 0; i < enemyBullets.length; i++) {
+    var b = enemyBullets[i];
+    var screenX = b.x - camera.x;
+    var screenY = b.y - camera.y;
+
+    ctx.globalAlpha = 0.35;
+    ctx.fillStyle = b.glow;
+    ctx.beginPath();
+    ctx.arc(screenX, screenY, b.radius * 2.2, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = b.core;
+    ctx.beginPath();
+    ctx.arc(screenX, screenY, b.radius, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+// Red laser telegraph from any shooter currently in its AIM state,
+// pointing at the player's live position -- the "visible, warned" part
+// of Prompt 10's dodgeable ranged attack. Brightens as the aim charges.
+function drawShooterLasers() {
+  if (!USE_RANGED) return;
+
+  for (var i = 0; i < enemies.length; i++) {
+    var e = enemies[i];
+    if (e.type !== "shooter" || e.rangedState !== "aim") continue;
+
+    var t = 1 - e.rangedTimer / CONFIG.SHOOTER_AIM_TIME; // 0 -> 1 as it charges
+    ctx.globalAlpha = 0.3 + t * 0.6;
+    ctx.strokeStyle = "#ff3333";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(e.x - camera.x, e.y - camera.y);
+    ctx.lineTo(player.x - camera.x, player.y - camera.y);
+    ctx.stroke();
+  }
+
+  ctx.globalAlpha = 1;
 }
 
 // Short-lived muzzle flash sprite, drawn just in front of the player
@@ -1908,6 +2144,7 @@ function resetGame() {
   perfLogTimer = 2;
 
   bullets = [];
+  enemyBullets = [];
   pistolCooldown = 0;
   shotgunCooldown = 0;
   muzzleFlashSize = CONFIG.MUZZLE_FLASH_SIZE;
