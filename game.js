@@ -98,7 +98,6 @@ var CONFIG = {
   SHOTGUN_MUZZLE_FLASH_SIZE: 40, // "wide muzzle" -- bigger than the pistol's
   SHOTGUN_SHAKE_AMOUNT: 6, // "stronger shake" than the pistol's tiny 2px
 
-  DRONE_COUNT: 1,
   DRONE_RADIUS: 95, // px from the player the drone orbits at
   DRONE_ANGULAR_SPEED: 3.2, // rad/s
   DRONE_DRAW_SIZE: 30,
@@ -112,6 +111,24 @@ var CONFIG = {
 
   XP_BASE: 8, // XP needed for Lv1 -> Lv2
   XP_PER_LEVEL: 9, // extra XP needed per level after that (need = 8 + (level-1)*9)
+
+  // --- Level-up upgrade pool (Prompt 5, GDD section 7's Pool 12) ---
+  UPGRADE_PISTOL_DMG_STEP: 3,
+  UPGRADE_PISTOL_CD_STEP: 0.08,
+  UPGRADE_PISTOL_CD_MIN: 0.32,
+  UPGRADE_SHOTGUN_PELLET_MAX: 7,
+  UPGRADE_SHOTGUN_DMG_STEP: 4,
+  UPGRADE_DRONE_DMG_STEP: 12,
+  UPGRADE_DRONE_COUNT_MAX: 3,
+  DRONE_BASE_COUNT: 1, // drones granted the instant the drone is first unlocked
+  UPGRADE_HP_MAX_STEP: 20,
+  UPGRADE_SPEED_STEP: 0.12,
+  UPGRADE_SPEED_MULT_MAX: 1.6, // +60%
+  UPGRADE_MAGNET_STEP: 50,
+  UPGRADE_ARMOR_STEP: 3,
+  UPGRADE_REGEN_STEP: 0.8,
+  AIRSTRIKE_DMG: 80,
+  AIRSTRIKE_SHAKE_AMOUNT: 14, // "big shake" -- more than the shotgun's 6px
 };
 
 // -------------------------------------------------------------
@@ -136,6 +153,14 @@ var player = {
   level: 1,
   xp: 0,
   xpToNext: CONFIG.XP_BASE, // recomputed via xpNeededForLevel() on every level-up
+
+  // Upgradeable stats -- these start as copies of the CONFIG baseline and
+  // get modified by level-up picks, so CONFIG itself never changes.
+  hpMax: CONFIG.PLAYER_HP_MAX,
+  speedMult: 1, // multiplies CONFIG.PLAYER_SPEED; +12%/pick, capped at UPGRADE_SPEED_MULT_MAX
+  magnet: CONFIG.PLAYER_MAGNET,
+  armor: 0, // flat damage reduction, taking at least 1 dmg always gets through
+  regen: 0, // HP per second
 };
 
 // Camera = top-left corner of the view into the world, in world pixels.
@@ -144,9 +169,29 @@ var camera = {
   y: 0,
 };
 
-// Orbit drones: each is just an angle around the player. DRONE_COUNT is
-// fixed at 1 for now (no upgrades yet), so this starts with one entry.
-var drones = [{ angle: 0 }];
+// Weapon stats that level-up picks modify. Pistol starts active; shotgun
+// and drone start locked and only turn on once their first upgrade card
+// is picked (see ensureShotgunUnlocked()/ensureDroneUnlocked() below).
+var weapons = {
+  pistol: {
+    dmg: CONFIG.PISTOL_DMG,
+    fireInterval: CONFIG.PISTOL_FIRE_INTERVAL,
+  },
+  shotgun: {
+    unlocked: false,
+    pelletCount: CONFIG.SHOTGUN_PELLET_COUNT,
+    dmg: CONFIG.SHOTGUN_PELLET_DMG,
+  },
+  drone: {
+    unlocked: false,
+    dmg: CONFIG.DRONE_DMG,
+    count: 0,
+  },
+};
+
+// Orbit drones: each is just an angle around the player. Starts empty --
+// the drone is locked until a level-up pick unlocks it.
+var drones = [];
 
 // All enemies currently alive (walkers/runners/brutes), as plain objects.
 var enemies = [];
@@ -246,6 +291,11 @@ var KEYS = {}; // e.g. KEYS["w"] === true while W is held
 
 window.addEventListener("keydown", function (e) {
   KEYS[e.key.toLowerCase()] = true;
+
+  // 1/2/3 pick a level-up card, same as clicking it.
+  if (STATE.mode === "levelup" && (e.key === "1" || e.key === "2" || e.key === "3")) {
+    pickUpgrade(Number(e.key) - 1);
+  }
 });
 
 window.addEventListener("keyup", function (e) {
@@ -359,6 +409,17 @@ function killEnemy(index, e) {
   spawnGem(e.x, e.y, e.xp);
 }
 
+// Applies damage + a floating number to one enemy, killing it if it drops
+// to 0 HP. Shared by bullets, the drone, and the airstrike upgrade so
+// they don't each re-implement "hit it, show a number, maybe kill it".
+function damageEnemyAt(index, e, amount) {
+  e.hp -= amount;
+  spawnDamageNumber(e.x, e.y, amount);
+  if (e.hp <= 0) {
+    killEnemy(index, e);
+  }
+}
+
 // How many enemies are allowed alive at once, based on run time so
 // far. Widens in steps as the wave table calls for tougher minutes.
 function getAliveCap() {
@@ -461,8 +522,7 @@ function updateEnemies(dt) {
     // Touch damage: only if close enough AND player isn't in i-frames.
     var touchDist = CONFIG.PLAYER_RADIUS + e.radius;
     if (dist < touchDist && player.iframe <= 0) {
-      player.hp = clamp(player.hp - e.touchDmg, 0, CONFIG.PLAYER_HP_MAX);
-      player.iframe = CONFIG.PLAYER_IFRAME_TIME;
+      damagePlayer(e.touchDmg);
     }
   }
 
@@ -515,7 +575,7 @@ function firePistol(target) {
     vx: dirX * CONFIG.PISTOL_BULLET_SPEED,
     vy: dirY * CONFIG.PISTOL_BULLET_SPEED,
     life: CONFIG.PISTOL_BULLET_LIFE,
-    dmg: CONFIG.PISTOL_DMG,
+    dmg: weapons.pistol.dmg,
     radius: CONFIG.PISTOL_BULLET_RADIUS,
     knockback: 0,
   });
@@ -538,13 +598,14 @@ function fireShotgun(target) {
   var dirY = dy / dist;
   var baseAngle = Math.atan2(dirY, dirX);
 
-  // Spread SHOTGUN_PELLET_COUNT pellets evenly across the cone, centered
+  // Spread the current pellet count evenly across the cone, centered
   // on the target's direction.
+  var pelletCount = weapons.shotgun.pelletCount;
   var coneRad = (CONFIG.SHOTGUN_CONE_DEG * Math.PI) / 180;
-  var step = CONFIG.SHOTGUN_PELLET_COUNT > 1 ? coneRad / (CONFIG.SHOTGUN_PELLET_COUNT - 1) : 0;
+  var step = pelletCount > 1 ? coneRad / (pelletCount - 1) : 0;
   var startAngle = baseAngle - coneRad / 2;
 
-  for (var i = 0; i < CONFIG.SHOTGUN_PELLET_COUNT; i++) {
+  for (var i = 0; i < pelletCount; i++) {
     var angle = startAngle + step * i;
     bullets.push({
       x: player.x,
@@ -552,7 +613,7 @@ function fireShotgun(target) {
       vx: Math.cos(angle) * CONFIG.SHOTGUN_PELLET_SPEED,
       vy: Math.sin(angle) * CONFIG.SHOTGUN_PELLET_SPEED,
       life: CONFIG.SHOTGUN_PELLET_LIFE,
-      dmg: CONFIG.SHOTGUN_PELLET_DMG,
+      dmg: weapons.shotgun.dmg,
       radius: CONFIG.SHOTGUN_PELLET_RADIUS,
       knockback: CONFIG.SHOTGUN_KNOCKBACK,
     });
@@ -569,6 +630,8 @@ function fireShotgun(target) {
 }
 
 function updateShotgun(dt) {
+  if (!weapons.shotgun.unlocked) return; // locked until a shotgun card is picked
+
   shotgunCooldown -= dt;
   if (shotgunCooldown <= 0) {
     var target = findNearestEnemy(CONFIG.SHOTGUN_RANGE);
@@ -595,7 +658,7 @@ function updatePistol(dt) {
   if (pistolCooldown <= 0) {
     if (target) {
       firePistol(target);
-      pistolCooldown = CONFIG.PISTOL_FIRE_INTERVAL;
+      pistolCooldown = weapons.pistol.fireInterval;
     }
     // No target yet -- leave cooldown at/below 0 so we just check again
     // next frame instead of waiting out a full interval for nothing.
@@ -637,9 +700,6 @@ function updateBullets(dt) {
         var dist = Math.sqrt(dx * dx + dy * dy);
 
         if (dist < e.radius + b.radius) {
-          e.hp -= b.dmg;
-          spawnDamageNumber(e.x, e.y, b.dmg);
-
           // Shove the enemy away from the player (brutes shrug it off --
           // GDD calls them "knock-resist").
           if (b.knockback && e.type !== "brute") {
@@ -650,9 +710,7 @@ function updateBullets(dt) {
             e.y += (kdy / kdist) * b.knockback;
           }
 
-          if (e.hp <= 0) {
-            killEnemy(j, e);
-          }
+          damageEnemyAt(j, e, b.dmg);
 
           hitSomething = true;
           break;
@@ -686,6 +744,8 @@ function droneWorldY(drone) {
 }
 
 function updateDrones(dt) {
+  if (!weapons.drone.unlocked) return; // locked until a drone card is picked
+
   for (var i = 0; i < drones.length; i++) {
     drones[i].angle += CONFIG.DRONE_ANGULAR_SPEED * dt;
   }
@@ -706,14 +766,8 @@ function updateDrones(dt) {
       var contactDist = CONFIG.DRONE_DRAW_SIZE / 2 + e.radius;
 
       if (dist < contactDist) {
-        e.hp -= CONFIG.DRONE_DMG;
-        spawnDamageNumber(e.x, e.y, CONFIG.DRONE_DMG);
         e.droneHitCooldown = CONFIG.DRONE_HIT_COOLDOWN;
-
-        if (e.hp <= 0) {
-          killEnemy(j, e);
-        }
-
+        damageEnemyAt(j, e, weapons.drone.dmg);
         break; // one drone's worth of damage per enemy per frame is enough
       }
     }
@@ -790,7 +844,7 @@ function updateGems(dt) {
       continue;
     }
 
-    if (dist < CONFIG.PLAYER_MAGNET && dist > 0) {
+    if (dist < player.magnet && dist > 0) {
       g.x += (dx / dist) * CONFIG.GEM_CHASE_SPEED * dt;
       g.y += (dy / dist) * CONFIG.GEM_CHASE_SPEED * dt;
     }
@@ -809,8 +863,9 @@ function update(dt) {
 
   // --- move player ---
   var move = getMoveVector();
-  player.x += move.dx * CONFIG.PLAYER_SPEED * dt;
-  player.y += move.dy * CONFIG.PLAYER_SPEED * dt;
+  var speed = CONFIG.PLAYER_SPEED * player.speedMult;
+  player.x += move.dx * speed * dt;
+  player.y += move.dy * speed * dt;
 
   // keep player inside the world bounds
   player.x = clamp(player.x, 0, CONFIG.WORLD_W);
@@ -824,6 +879,11 @@ function update(dt) {
   // count down i-frames after being hit
   if (player.iframe > 0) {
     player.iframe -= dt;
+  }
+
+  // passive regen from the Regeneration upgrade (0 until picked)
+  if (player.regen > 0) {
+    player.hp = clamp(player.hp + player.regen * dt, 0, player.hpMax);
   }
 
   // --- camera follows player, clamped so it never shows outside the world ---
@@ -844,6 +904,15 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
+// Applies incoming damage after armor reduction (always at least 1 dmg
+// gets through) and resets i-frames. The one place anything that hurts
+// the player should go through.
+function damagePlayer(amount) {
+  var reduced = Math.max(1, amount - player.armor);
+  player.hp = clamp(player.hp - reduced, 0, player.hpMax);
+  player.iframe = CONFIG.PLAYER_IFRAME_TIME;
+}
+
 // -------------------------------------------------------------
 // SECTION: RENDER (stub)
 // Draws the current frame to the canvas. Runs every frame
@@ -861,10 +930,10 @@ var xpBarEl = document.getElementById("hud-xp-bar");
 var levelEl = document.getElementById("hud-level");
 
 function updateHud() {
-  var pct = player.hp / CONFIG.PLAYER_HP_MAX;
+  var pct = player.hp / player.hpMax;
   hpBarEl.style.width = pct * 100 + "%";
   hpBarEl.style.background = pct < 0.3 ? "#e33" : "#3ecf5e"; // red warning when low
-  hpTextEl.textContent = Math.ceil(player.hp) + "/" + CONFIG.PLAYER_HP_MAX;
+  hpTextEl.textContent = Math.ceil(player.hp) + "/" + player.hpMax;
   killsEl.textContent = "Kills: " + STATE.kills;
   xpBarEl.style.width = (player.xp / player.xpToNext) * 100 + "%";
   levelEl.textContent = "Lv " + player.level;
@@ -1081,6 +1150,246 @@ function gameLoop(timestamp) {
 
   requestAnimationFrame(gameLoop);
 }
+
+// -------------------------------------------------------------
+// SECTION: LEVEL-UP UI
+// On 'levelup' (dispatched from collectGem()), pause the simulation
+// (update() already skips everything unless STATE.mode === "play")
+// and show 3 random upgrade cards. Picking one applies it and either
+// resumes play or -- if more level-ups are still pending from one
+// big XP gain -- immediately shows a fresh set of 3 (chaining).
+// -------------------------------------------------------------
+
+// Shotgun/drone start locked; picking any of their upgrade cards for
+// the first time unlocks the weapon in addition to applying its effect.
+function ensureShotgunUnlocked() {
+  weapons.shotgun.unlocked = true;
+}
+
+function ensureDroneUnlocked() {
+  if (!weapons.drone.unlocked) {
+    weapons.drone.unlocked = true;
+    weapons.drone.count = CONFIG.DRONE_BASE_COUNT;
+    rebuildDrones();
+  }
+}
+
+// Rebuilds the drones array to match weapons.drone.count, spacing
+// however many there are evenly around the orbit.
+function rebuildDrones() {
+  drones = [];
+  for (var i = 0; i < weapons.drone.count; i++) {
+    drones.push({ angle: (i / weapons.drone.count) * Math.PI * 2 });
+  }
+}
+
+// One-time nuke: damages every enemy currently alive, plus a big shake.
+function applyAirstrike() {
+  for (var i = enemies.length - 1; i >= 0; i--) {
+    damageEnemyAt(i, enemies[i], CONFIG.AIRSTRIKE_DMG);
+  }
+  screenShake = Math.max(screenShake, CONFIG.AIRSTRIKE_SHAKE_AMOUNT);
+  playSound("airstrike_whistle");
+}
+
+// The 12-card pool (GDD section 7). Each `desc` is a function (not a
+// plain string) so cards like "shotgun_pellet" can read as "Unlock
+// Shotgun" the first time and "+1 pellet" afterward.
+var UPGRADES = [
+  {
+    id: "pistol_dmg",
+    name: "Pistol Damage",
+    desc: function () { return "+" + CONFIG.UPGRADE_PISTOL_DMG_STEP + " dmg"; },
+    isMaxed: function () { return false; },
+    apply: function () { weapons.pistol.dmg += CONFIG.UPGRADE_PISTOL_DMG_STEP; },
+  },
+  {
+    id: "pistol_cd",
+    name: "Pistol Fire Rate",
+    desc: function () { return "-" + CONFIG.UPGRADE_PISTOL_CD_STEP + "s cooldown"; },
+    isMaxed: function () { return weapons.pistol.fireInterval <= CONFIG.UPGRADE_PISTOL_CD_MIN; },
+    apply: function () {
+      weapons.pistol.fireInterval = Math.max(
+        CONFIG.UPGRADE_PISTOL_CD_MIN,
+        weapons.pistol.fireInterval - CONFIG.UPGRADE_PISTOL_CD_STEP
+      );
+    },
+  },
+  {
+    id: "shotgun_pellet",
+    name: "Shotgun Pellets",
+    desc: function () {
+      return weapons.shotgun.unlocked ? "+1 pellet (max 7)" : "Unlock Shotgun (+1 pellet)";
+    },
+    isMaxed: function () {
+      return weapons.shotgun.unlocked && weapons.shotgun.pelletCount >= CONFIG.UPGRADE_SHOTGUN_PELLET_MAX;
+    },
+    apply: function () {
+      ensureShotgunUnlocked();
+      weapons.shotgun.pelletCount = Math.min(CONFIG.UPGRADE_SHOTGUN_PELLET_MAX, weapons.shotgun.pelletCount + 1);
+    },
+  },
+  {
+    id: "shotgun_dmg",
+    name: "Shotgun Damage",
+    desc: function () {
+      return (weapons.shotgun.unlocked ? "+" : "Unlock Shotgun (+") + CONFIG.UPGRADE_SHOTGUN_DMG_STEP + " dmg/pellet" + (weapons.shotgun.unlocked ? "" : ")");
+    },
+    isMaxed: function () { return false; },
+    apply: function () {
+      ensureShotgunUnlocked();
+      weapons.shotgun.dmg += CONFIG.UPGRADE_SHOTGUN_DMG_STEP;
+    },
+  },
+  {
+    id: "drone_dmg",
+    name: "Drone Damage",
+    desc: function () {
+      return (weapons.drone.unlocked ? "+" : "Unlock Drone (+") + CONFIG.UPGRADE_DRONE_DMG_STEP + " dmg" + (weapons.drone.unlocked ? "" : ")");
+    },
+    isMaxed: function () { return false; },
+    apply: function () {
+      ensureDroneUnlocked();
+      weapons.drone.dmg += CONFIG.UPGRADE_DRONE_DMG_STEP;
+    },
+  },
+  {
+    id: "drone_count",
+    name: "Extra Drone",
+    desc: function () {
+      return weapons.drone.unlocked ? "+1 drone (max 3)" : "Unlock Drone (+1 extra)";
+    },
+    isMaxed: function () {
+      return weapons.drone.unlocked && weapons.drone.count >= CONFIG.UPGRADE_DRONE_COUNT_MAX;
+    },
+    apply: function () {
+      ensureDroneUnlocked();
+      weapons.drone.count = Math.min(CONFIG.UPGRADE_DRONE_COUNT_MAX, weapons.drone.count + 1);
+      rebuildDrones();
+    },
+  },
+  {
+    id: "hp_max",
+    name: "Vitality",
+    desc: function () { return "+" + CONFIG.UPGRADE_HP_MAX_STEP + " max HP, full heal of that much"; },
+    isMaxed: function () { return false; },
+    apply: function () {
+      player.hpMax += CONFIG.UPGRADE_HP_MAX_STEP;
+      player.hp = clamp(player.hp + CONFIG.UPGRADE_HP_MAX_STEP, 0, player.hpMax);
+    },
+  },
+  {
+    id: "speed",
+    name: "Boots",
+    desc: function () { return "+12% move speed"; },
+    isMaxed: function () { return player.speedMult >= CONFIG.UPGRADE_SPEED_MULT_MAX - 0.001; },
+    apply: function () {
+      player.speedMult = Math.min(CONFIG.UPGRADE_SPEED_MULT_MAX, player.speedMult + CONFIG.UPGRADE_SPEED_STEP);
+    },
+  },
+  {
+    id: "magnet",
+    name: "Magnet",
+    desc: function () { return "+" + CONFIG.UPGRADE_MAGNET_STEP + "px gem pickup range"; },
+    isMaxed: function () { return false; },
+    apply: function () { player.magnet += CONFIG.UPGRADE_MAGNET_STEP; },
+  },
+  {
+    id: "armor",
+    name: "Armor Plating",
+    desc: function () { return "-" + CONFIG.UPGRADE_ARMOR_STEP + " dmg taken (min 1)"; },
+    isMaxed: function () { return false; },
+    apply: function () { player.armor += CONFIG.UPGRADE_ARMOR_STEP; },
+  },
+  {
+    id: "regen",
+    name: "Regeneration",
+    desc: function () { return "+" + CONFIG.UPGRADE_REGEN_STEP + " HP/sec"; },
+    isMaxed: function () { return false; },
+    apply: function () { player.regen += CONFIG.UPGRADE_REGEN_STEP; },
+  },
+  {
+    id: "airstrike",
+    name: "Airstrike",
+    desc: function () { return CONFIG.AIRSTRIKE_DMG + " dmg to everything alive right now"; },
+    isMaxed: function () { return false; },
+    apply: function () { applyAirstrike(); },
+  },
+];
+
+var pendingLevelUps = 0; // how many level-up panels are queued (chaining)
+var currentCards = []; // the (up to) 3 upgrades shown right now
+
+window.addEventListener("levelup", function () {
+  pendingLevelUps++;
+  if (STATE.mode === "play") {
+    showLevelUpPanel();
+  }
+  // If a panel is already showing, the extra pending level-up gets
+  // picked up automatically once the current pick resolves.
+});
+
+// Picks `count` distinct, not-yet-maxed upgrades at random.
+function pickRandomUpgrades(count) {
+  var pool = UPGRADES.filter(function (u) { return !u.isMaxed(); });
+  var chosen = [];
+  while (chosen.length < count && pool.length > 0) {
+    var i = Math.floor(Math.random() * pool.length);
+    chosen.push(pool[i]);
+    pool.splice(i, 1);
+  }
+  return chosen;
+}
+
+var levelupOverlayEl = document.getElementById("levelup-overlay");
+var levelupCardEls = [
+  document.getElementById("levelup-card-1"),
+  document.getElementById("levelup-card-2"),
+  document.getElementById("levelup-card-3"),
+];
+
+function showLevelUpPanel() {
+  STATE.mode = "levelup";
+  currentCards = pickRandomUpgrades(3);
+
+  for (var i = 0; i < levelupCardEls.length; i++) {
+    var el = levelupCardEls[i];
+    var upgrade = currentCards[i];
+
+    if (!upgrade) {
+      // Fewer than 3 upgrades left available (most things maxed out) --
+      // just hide the extra card slot(s).
+      el.style.display = "none";
+      continue;
+    }
+
+    el.style.display = "";
+    el.querySelector(".levelup-card-name").textContent = upgrade.name;
+    el.querySelector(".levelup-card-desc").textContent = upgrade.desc();
+  }
+
+  levelupOverlayEl.classList.remove("hidden");
+}
+
+function pickUpgrade(index) {
+  if (STATE.mode !== "levelup") return;
+  var upgrade = currentCards[index];
+  if (!upgrade) return;
+
+  upgrade.apply();
+  pendingLevelUps--;
+
+  if (pendingLevelUps > 0) {
+    showLevelUpPanel(); // chain: another level-up was already queued
+  } else {
+    levelupOverlayEl.classList.add("hidden");
+    STATE.mode = "play";
+  }
+}
+
+levelupCardEls.forEach(function (el, i) {
+  el.addEventListener("click", function () { pickUpgrade(i); });
+});
 
 // -------------------------------------------------------------
 // SECTION: TITLE OVERLAY

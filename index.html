@@ -39,7 +39,8 @@
 
   #game,
   #hud,
-  #overlay {
+  #overlay,
+  #levelup-overlay {
     position: absolute;
     inset: 0;
     width: 100%;
@@ -167,6 +168,65 @@
   #start-btn:hover {
     background: #6fe3ff;
   }
+
+  /* ---- Level-up overlay: 3 upgrade cards, dims the frozen game behind it ---- */
+  #levelup-overlay {
+    background: rgba(0, 0, 0, 0.75);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+  }
+
+  #levelup-overlay.hidden {
+    display: none;
+  }
+
+  #levelup-overlay h2 {
+    font-size: 30px;
+    margin: 0 0 24px 0;
+    letter-spacing: 1px;
+    text-shadow: 3px 3px 0 #000;
+  }
+
+  #levelup-cards {
+    display: flex;
+    gap: 20px;
+  }
+
+  .levelup-card {
+    width: 190px;
+    padding: 18px 14px;
+    background: #1a1a1a;
+    border: 2px solid #3dd6ff;
+    border-radius: 8px;
+    color: #e6e6e6;
+    cursor: pointer;
+    font-family: inherit;
+  }
+
+  .levelup-card:hover {
+    background: #23303a;
+    border-color: #6fe3ff;
+  }
+
+  .levelup-card-key {
+    font-size: 12px;
+    color: #888;
+    margin-bottom: 8px;
+  }
+
+  .levelup-card-name {
+    font-size: 17px;
+    font-weight: bold;
+    margin-bottom: 8px;
+  }
+
+  .levelup-card-desc {
+    font-size: 13px;
+    color: #ccc;
+  }
 </style>
 </head>
 <body>
@@ -188,6 +248,28 @@
       <div id="overlay">
         <h1>LAST OPERATOR: DEAD ZONE</h1>
         <button id="start-btn">START</button>
+      </div>
+
+      <!-- Level-up overlay: hidden until a 'levelup' event shows 3 cards -->
+      <div id="levelup-overlay" class="hidden">
+        <h2>LEVEL UP — Pick 1</h2>
+        <div id="levelup-cards">
+          <button class="levelup-card" id="levelup-card-1">
+            <div class="levelup-card-key">1</div>
+            <div class="levelup-card-name"></div>
+            <div class="levelup-card-desc"></div>
+          </button>
+          <button class="levelup-card" id="levelup-card-2">
+            <div class="levelup-card-key">2</div>
+            <div class="levelup-card-name"></div>
+            <div class="levelup-card-desc"></div>
+          </button>
+          <button class="levelup-card" id="levelup-card-3">
+            <div class="levelup-card-key">3</div>
+            <div class="levelup-card-name"></div>
+            <div class="levelup-card-desc"></div>
+          </button>
+        </div>
       </div>
     </div>
   </div>
