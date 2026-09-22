@@ -34,12 +34,38 @@ var CONFIG = {
   WALKER_XP: 1, // used once gems exist in a later prompt
   WALKER_RADIUS: 13,
   WALKER_DRAW_SIZE: 40,
+  SPAWN_INTERVAL: 1.0, // seconds between walker spawns (always active)
 
-  SPAWN_RING_MIN: 720, // walkers spawn in a ring this far from the player...
+  RUNNER_HP: 14,
+  RUNNER_TOUCH_DMG: 8,
+  RUNNER_SPEED: 145,
+  RUNNER_XP: 2,
+  RUNNER_RADIUS: 11,
+  RUNNER_DRAW_SIZE: 40,
+  RUNNER_ZIGZAG_HZ: 2, // wiggle frequency (GDD: sin 2Hz)
+  RUNNER_ZIGZAG_AMP: 30, // sideways wiggle strength, added as extra speed
+  RUNNER_MIN_START: 2, // runners start spawning at Min 2
+  RUNNER_SPAWN_INTERVAL: 2.5,
+
+  BRUTE_HP: 140,
+  BRUTE_TOUCH_DMG: 20,
+  BRUTE_SPEED: 48,
+  BRUTE_XP: 8,
+  BRUTE_RADIUS: 20,
+  BRUTE_DRAW_SIZE: 60,
+  BRUTE_MIN_START: 5, // brutes start spawning at Min 5
+  BRUTE_SPAWN_INTERVAL: 6.0,
+
+  SPAWN_RING_MIN: 720, // enemies spawn in a ring this far from the player...
   SPAWN_RING_MAX: 940, // ...so they never pop into view
-  SPAWN_INTERVAL: 1.0, // seconds between spawns
-  SPAWN_CAP: 25, // max walkers alive at once (Min 0-2 per wave table)
-  DESPAWN_DIST: 1300, // walkers this far away get removed (no XP refund)
+  DESPAWN_DIST: 1300, // enemies this far away get removed (no XP refund)
+
+  // Alive cap ramps up as the run goes on (Min 0-2 / 2-5 / 5+ per wave table).
+  CAP_MIN_0_2: 25,
+  CAP_MIN_2_5: 50,
+  CAP_MIN_5_PLUS: 80,
+
+  SEPARATION_PUSH: 18, // max px two overlapping enemies get shoved apart per frame
 };
 
 // -------------------------------------------------------------
@@ -50,6 +76,7 @@ var CONFIG = {
 var STATE = {
   mode: "title", // title -> play -> ... (more modes added in later prompts)
   lastTime: 0,   // timestamp of previous animation frame, for computing dt
+  elapsed: 0,    // seconds spent in "play" mode -- drives spawn timing/caps
 };
 
 // The player, dropped in the middle of the world to start.
@@ -67,9 +94,12 @@ var camera = {
   y: 0,
 };
 
-// All walkers currently alive, as plain {x, y, hp, radius} objects.
+// All enemies currently alive (walkers/runners/brutes), as plain objects.
 var enemies = [];
-var spawnTimer = 0; // counts down to the next walker spawn
+var walkerSpawnTimer = 0;
+var runnerSpawnTimer = 0;
+var bruteSpawnTimer = 0;
+var perfLogTimer = 2; // logs enemy count to console every 2s (Prompt 2b perf check)
 
 // -------------------------------------------------------------
 // SECTION: ASSET LOADER
@@ -178,32 +208,120 @@ function audioInit() {
 
 // -------------------------------------------------------------
 // SECTION: ENEMIES
-// Walkers are plain objects in an array (no classes needed).
-// The spawner drops one in a ring around the player every second;
-// each walker just walks straight at the player until it touches
-// them or wanders too far away.
+// Enemies are plain objects in one array (no classes needed).
+// Each has a "type" (walker/runner/brute) plus its own hp/speed/
+// radius/touchDmg, so the shared movement+collision loop below
+// doesn't need to know the differences -- except runners, which
+// get an extra sideways wiggle.
 // -------------------------------------------------------------
-function spawnWalker() {
-  // Pick a random point on a ring around the player so walkers
-  // appear just off-screen instead of popping into view.
+
+// Drops a new enemy in a ring around the player so it appears just
+// off-screen instead of popping into view. `props` carries the
+// type-specific stats (hp/speed/radius/touchDmg/...).
+function spawnEnemyInRing(props) {
   var angle = Math.random() * Math.PI * 2;
   var dist = CONFIG.SPAWN_RING_MIN + Math.random() * (CONFIG.SPAWN_RING_MAX - CONFIG.SPAWN_RING_MIN);
 
-  enemies.push({
-    x: player.x + Math.cos(angle) * dist,
-    y: player.y + Math.sin(angle) * dist,
+  props.x = player.x + Math.cos(angle) * dist;
+  props.y = player.y + Math.sin(angle) * dist;
+  enemies.push(props);
+}
+
+function spawnWalker() {
+  spawnEnemyInRing({
+    type: "walker",
     hp: CONFIG.WALKER_HP,
     radius: CONFIG.WALKER_RADIUS,
+    speed: CONFIG.WALKER_SPEED,
+    touchDmg: CONFIG.WALKER_TOUCH_DMG,
   });
 }
 
+function spawnRunner() {
+  spawnEnemyInRing({
+    type: "runner",
+    hp: CONFIG.RUNNER_HP,
+    radius: CONFIG.RUNNER_RADIUS,
+    speed: CONFIG.RUNNER_SPEED,
+    touchDmg: CONFIG.RUNNER_TOUCH_DMG,
+    phase: Math.random() * Math.PI * 2, // offsets the wiggle so runners don't all sway in sync
+  });
+}
+
+function spawnBrute() {
+  // Knock-resist (GDD) has nothing to resist yet -- there's no
+  // knockback system until the Juice Pack prompt -- so it's not
+  // tracked here.
+  spawnEnemyInRing({
+    type: "brute",
+    hp: CONFIG.BRUTE_HP,
+    radius: CONFIG.BRUTE_RADIUS,
+    speed: CONFIG.BRUTE_SPEED,
+    touchDmg: CONFIG.BRUTE_TOUCH_DMG,
+  });
+}
+
+// How many enemies are allowed alive at once, based on run time so
+// far. Widens in steps as the wave table calls for tougher minutes.
+function getAliveCap() {
+  var elapsedMin = STATE.elapsed / 60;
+  if (elapsedMin >= 5) return CONFIG.CAP_MIN_5_PLUS;
+  if (elapsedMin >= 2) return CONFIG.CAP_MIN_2_5;
+  return CONFIG.CAP_MIN_0_2;
+}
+
+// Cheap pair separation: any two overlapping enemies get nudged
+// apart, capped to a small push per frame so it stays smooth even
+// with dozens of enemies (an O(n^2) loop, but n stays under ~100).
+function applySeparation() {
+  var maxPush = CONFIG.SEPARATION_PUSH / 2; // half each, so the pair separates by the full amount
+
+  for (var i = 0; i < enemies.length; i++) {
+    for (var j = i + 1; j < enemies.length; j++) {
+      var a = enemies[i];
+      var b = enemies[j];
+      var dx = b.x - a.x;
+      var dy = b.y - a.y;
+      var dist = Math.sqrt(dx * dx + dy * dy);
+      var minDist = a.radius + b.radius;
+
+      if (dist > 0 && dist < minDist) {
+        var overlap = minDist - dist;
+        var pushX = clamp((dx / dist) * overlap * 0.5, -maxPush, maxPush);
+        var pushY = clamp((dy / dist) * overlap * 0.5, -maxPush, maxPush);
+        a.x -= pushX;
+        a.y -= pushY;
+        b.x += pushX;
+        b.y += pushY;
+      }
+    }
+  }
+}
+
 function updateEnemies(dt) {
-  // Spawner: drop a new walker every SPAWN_INTERVAL seconds, up to the cap.
-  spawnTimer -= dt;
-  if (spawnTimer <= 0) {
-    spawnTimer = CONFIG.SPAWN_INTERVAL;
-    if (enemies.length < CONFIG.SPAWN_CAP) {
-      spawnWalker();
+  var cap = getAliveCap();
+  var elapsedMin = STATE.elapsed / 60;
+
+  // --- spawners: walkers always run, runners/brutes unlock at their minute ---
+  walkerSpawnTimer -= dt;
+  if (walkerSpawnTimer <= 0) {
+    walkerSpawnTimer = CONFIG.SPAWN_INTERVAL;
+    if (enemies.length < cap) spawnWalker();
+  }
+
+  if (elapsedMin >= CONFIG.RUNNER_MIN_START) {
+    runnerSpawnTimer -= dt;
+    if (runnerSpawnTimer <= 0) {
+      runnerSpawnTimer = CONFIG.RUNNER_SPAWN_INTERVAL;
+      if (enemies.length < cap) spawnRunner();
+    }
+  }
+
+  if (elapsedMin >= CONFIG.BRUTE_MIN_START) {
+    bruteSpawnTimer -= dt;
+    if (bruteSpawnTimer <= 0) {
+      bruteSpawnTimer = CONFIG.BRUTE_SPAWN_INTERVAL;
+      if (enemies.length < cap) spawnBrute();
     }
   }
 
@@ -224,16 +342,40 @@ function updateEnemies(dt) {
 
     // Walk straight toward the player.
     if (dist > 0) {
-      e.x += (dx / dist) * CONFIG.WALKER_SPEED * dt;
-      e.y += (dy / dist) * CONFIG.WALKER_SPEED * dt;
+      var dirX = dx / dist;
+      var dirY = dy / dist;
+      var moveX = dirX * e.speed * dt;
+      var moveY = dirY * e.speed * dt;
+
+      // Runners also wiggle side-to-side as they close in.
+      if (e.type === "runner") {
+        var perpX = -dirY;
+        var perpY = dirX;
+        var wiggle = Math.sin(STATE.elapsed * Math.PI * 2 * CONFIG.RUNNER_ZIGZAG_HZ + e.phase) * CONFIG.RUNNER_ZIGZAG_AMP;
+        moveX += perpX * wiggle * dt;
+        moveY += perpY * wiggle * dt;
+      }
+
+      e.x += moveX;
+      e.y += moveY;
     }
 
     // Touch damage: only if close enough AND player isn't in i-frames.
     var touchDist = CONFIG.PLAYER_RADIUS + e.radius;
     if (dist < touchDist && player.iframe <= 0) {
-      player.hp = clamp(player.hp - CONFIG.WALKER_TOUCH_DMG, 0, CONFIG.PLAYER_HP_MAX);
+      player.hp = clamp(player.hp - e.touchDmg, 0, CONFIG.PLAYER_HP_MAX);
       player.iframe = CONFIG.PLAYER_IFRAME_TIME;
     }
+  }
+
+  applySeparation();
+
+  // Perf check (Prompt 2b): log alive count every 2s so it's easy to
+  // eyeball whether the cap ramp is behaving during a long test run.
+  perfLogTimer -= dt;
+  if (perfLogTimer <= 0) {
+    perfLogTimer = 2;
+    console.log("enemies alive:", enemies.length, "/ cap:", cap, "| elapsed:", STATE.elapsed.toFixed(1) + "s");
   }
 }
 
@@ -244,6 +386,8 @@ function updateEnemies(dt) {
 // -------------------------------------------------------------
 function update(dt) {
   if (STATE.mode !== "play") return; // only simulate while actually playing
+
+  STATE.elapsed += dt; // drives spawn timing/caps in updateEnemies()
 
   // --- move player ---
   var move = getMoveVector();
@@ -333,20 +477,28 @@ function drawTiledBackground() {
   ctx.restore();
 }
 
-// Draws every walker at its screen position (world pos minus camera).
-// No rotation -- the art is a static top-down pose.
+// Which sprite + draw size to use per enemy type.
+var ENEMY_VISUALS = {
+  walker: { asset: "zmb_walker", size: CONFIG.WALKER_DRAW_SIZE },
+  runner: { asset: "zmb_runner", size: CONFIG.RUNNER_DRAW_SIZE },
+  brute: { asset: "zmb_brute", size: CONFIG.BRUTE_DRAW_SIZE },
+};
+
+// Draws every enemy at its screen position (world pos minus camera).
+// No rotation, no shadows/filters -- keep it cheap with 80+ alive.
 function drawEnemies() {
   for (var i = 0; i < enemies.length; i++) {
     var e = enemies[i];
+    var visual = ENEMY_VISUALS[e.type];
     var screenX = e.x - camera.x;
     var screenY = e.y - camera.y;
 
     ctx.drawImage(
-      ASSETS["zmb_walker"],
-      screenX - CONFIG.WALKER_DRAW_SIZE / 2,
-      screenY - CONFIG.WALKER_DRAW_SIZE / 2,
-      CONFIG.WALKER_DRAW_SIZE,
-      CONFIG.WALKER_DRAW_SIZE
+      ASSETS[visual.asset],
+      screenX - visual.size / 2,
+      screenY - visual.size / 2,
+      visual.size,
+      visual.size
     );
   }
 }
