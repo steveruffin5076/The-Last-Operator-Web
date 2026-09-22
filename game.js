@@ -476,6 +476,53 @@ function tone(f0, f1, dur, type, vol) {
   }
 }
 
+// A pure oscillator can only whistle -- real gunshots are mostly a burst
+// of broadband noise (the "crack"), which is why pistol_pew sounded like
+// a cartoon "pew" instead of a gun. This builds one shared buffer of
+// random noise (still 100% synthesized, no audio file) and reuses it.
+var noiseBufferCache = null;
+
+function getNoiseBuffer() {
+  if (!noiseBufferCache) {
+    var length = audioCtx.sampleRate; // 1 second, way more than any single burst needs
+    noiseBufferCache = audioCtx.createBuffer(1, length, audioCtx.sampleRate);
+    var data = noiseBufferCache.getChannelData(0);
+    for (var i = 0; i < length; i++) {
+      data[i] = Math.random() * 2 - 1;
+    }
+  }
+  return noiseBufferCache;
+}
+
+// A short filtered burst of that noise, sweeping the filter frequency
+// from freq0 down to freq1 over `dur` seconds -- the sweep is what makes
+// it read as a sharp "crack" instead of a flat hiss.
+function noiseBurst(dur, filterType, freq0, freq1, vol) {
+  if (!audioCtx || muted) return;
+  try {
+    var src = audioCtx.createBufferSource();
+    src.buffer = getNoiseBuffer();
+
+    var filter = audioCtx.createBiquadFilter();
+    filter.type = filterType;
+    var now = audioCtx.currentTime;
+    filter.frequency.setValueAtTime(freq0, now);
+    filter.frequency.exponentialRampToValueAtTime(Math.max(freq1, 1), now + dur);
+
+    var gain = audioCtx.createGain();
+    gain.gain.setValueAtTime(vol, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + dur);
+
+    src.connect(filter);
+    filter.connect(gain);
+    gain.connect(masterGain);
+    src.start(now);
+    src.stop(now + dur);
+  } catch (e) {
+    console.error("noiseBurst() failed:", e);
+  }
+}
+
 // Named hook every gameplay system calls (playSound('pistol_pew') etc.)
 // so this is the only place that needs to know what each SFX sounds like.
 function playSound(name) {
@@ -483,11 +530,17 @@ function playSound(name) {
   try {
     switch (name) {
       case "pistol_pew":
-        tone(900, 500, 0.08, "square", 1);
+        // Tactical crack: tight burst of high-passed noise (the "crack")
+        // layered over a very short low-end thump (the body/recoil).
+        noiseBurst(0.05, "highpass", 4500, 1500, 0.9);
+        tone(150, 60, 0.05, "triangle", 0.6);
         break;
 
       case "shotgun_boom":
-        tone(180, 60, 0.25, "sawtooth", 1);
+        // Same crack-plus-thump recipe, but longer and pitched way down
+        // for a heavier, punchier blast.
+        noiseBurst(0.22, "lowpass", 1800, 250, 1);
+        tone(140, 45, 0.22, "sawtooth", 0.7);
         break;
 
       case "gem_pickup":
@@ -527,7 +580,10 @@ function playSound(name) {
         break;
 
       case "shooter_shoot":
-        tone(700, 300, 0.08, "square", 0.7);
+        // The enemy's gun -- same crack-plus-thump recipe, tuned a bit
+        // duller/lower than the player's pistol so the two are tellable apart.
+        noiseBurst(0.06, "bandpass", 2800, 1000, 0.75);
+        tone(130, 50, 0.06, "triangle", 0.5);
         break;
 
       case "boss_spread":
