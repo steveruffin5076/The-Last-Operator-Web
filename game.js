@@ -75,14 +75,28 @@ var CONFIG = {
   PISTOL_BULLET_RADIUS: 5,
 
   MUZZLE_FLASH_TIME: 0.06, // seconds the muzzle flash sprite is visible
-  MUZZLE_FLASH_SIZE: 24,
+  MUZZLE_FLASH_SIZE: 24, // pistol's flash size
   MUZZLE_TIP_DIST: 18, // how far in front of the player the flash is drawn
 
-  FIRE_SHAKE_AMOUNT: 2, // px, "tiny shake" on every shot
+  FIRE_SHAKE_AMOUNT: 2, // px, "tiny shake" on every pistol shot
   SHAKE_DECAY_RATE: 40, // px/sec -- how fast shake settles back to 0
 
   DAMAGE_NUMBER_LIFE: 0.6, // seconds a floating damage number stays up
   DAMAGE_NUMBER_RISE: 40, // px/sec it drifts upward while fading
+
+  SHOTGUN_FIRE_INTERVAL: 2.2, // seconds between blasts
+  SHOTGUN_RANGE: 280,
+  SHOTGUN_PELLET_COUNT: 5,
+  SHOTGUN_CONE_DEG: 40, // total spread angle, centered on the target
+  SHOTGUN_PELLET_DMG: 8,
+  SHOTGUN_PELLET_LIFE: 0.5,
+  // speed = range / life, so a pellet that hits nothing fades out exactly at max range
+  SHOTGUN_PELLET_SPEED: 280 / 0.5,
+  SHOTGUN_PELLET_RADIUS: 4,
+  SHOTGUN_KNOCKBACK: 120, // px shoved away from the player on hit
+
+  SHOTGUN_MUZZLE_FLASH_SIZE: 40, // "wide muzzle" -- bigger than the pistol's
+  SHOTGUN_SHAKE_AMOUNT: 6, // "stronger shake" than the pistol's tiny 2px
 };
 
 // -------------------------------------------------------------
@@ -119,9 +133,14 @@ var runnerSpawnTimer = 0;
 var bruteSpawnTimer = 0;
 var perfLogTimer = 2; // logs enemy count to console every 2s (Prompt 2b perf check)
 
-// Pistol bullets currently in flight, as plain {x, y, vx, vy, life, dmg, radius}.
+// Bullets currently in flight (pistol tracers + shotgun pellets), as plain
+// {x, y, vx, vy, life, dmg, radius, knockback}. knockback is 0 for pistol.
 var bullets = [];
 var pistolCooldown = 0; // counts down to the next shot
+var shotgunCooldown = 0;
+
+// Muzzle flash size varies per weapon (shotgun's is "wide"), set at fire time.
+var muzzleFlashSize = CONFIG.MUZZLE_FLASH_SIZE;
 
 // Floating "-12" style damage numbers, as plain {x, y, value, life}.
 var damageNumbers = [];
@@ -240,6 +259,12 @@ function audioInit() {
   // Real oscillator sounds are added in a later prompt.
 }
 
+// Named hook so weapon code can call playSound('pistol_pew') etc. now,
+// without needing to change when Prompt 9 wires up real WebAudio SFX.
+function playSound(name) {
+  // no-op stub
+}
+
 // -------------------------------------------------------------
 // SECTION: ENEMIES
 // Enemies are plain objects in one array (no classes needed).
@@ -283,9 +308,8 @@ function spawnRunner() {
 }
 
 function spawnBrute() {
-  // Knock-resist (GDD) has nothing to resist yet -- there's no
-  // knockback system until the Juice Pack prompt -- so it's not
-  // tracked here.
+  // Knock-resist (GDD) is handled in updateBullets() by checking
+  // e.type === "brute" directly, so there's nothing to set here.
   spawnEnemyInRing({
     type: "brute",
     hp: CONFIG.BRUTE_HP,
@@ -453,6 +477,7 @@ function firePistol(target) {
     life: CONFIG.PISTOL_BULLET_LIFE,
     dmg: CONFIG.PISTOL_DMG,
     radius: CONFIG.PISTOL_BULLET_RADIUS,
+    knockback: 0,
   });
 
   // Muzzle flash + tiny shake, both purely cosmetic.
@@ -460,7 +485,58 @@ function firePistol(target) {
   muzzleFlashY = player.y + dirY * CONFIG.MUZZLE_TIP_DIST;
   muzzleFlashAngle = Math.atan2(dirY, dirX);
   muzzleFlashTimer = CONFIG.MUZZLE_FLASH_TIME;
+  muzzleFlashSize = CONFIG.MUZZLE_FLASH_SIZE;
   screenShake = Math.max(screenShake, CONFIG.FIRE_SHAKE_AMOUNT);
+  playSound("pistol_pew");
+}
+
+function fireShotgun(target) {
+  var dx = target.x - player.x;
+  var dy = target.y - player.y;
+  var dist = Math.sqrt(dx * dx + dy * dy) || 1;
+  var dirX = dx / dist;
+  var dirY = dy / dist;
+  var baseAngle = Math.atan2(dirY, dirX);
+
+  // Spread SHOTGUN_PELLET_COUNT pellets evenly across the cone, centered
+  // on the target's direction.
+  var coneRad = (CONFIG.SHOTGUN_CONE_DEG * Math.PI) / 180;
+  var step = CONFIG.SHOTGUN_PELLET_COUNT > 1 ? coneRad / (CONFIG.SHOTGUN_PELLET_COUNT - 1) : 0;
+  var startAngle = baseAngle - coneRad / 2;
+
+  for (var i = 0; i < CONFIG.SHOTGUN_PELLET_COUNT; i++) {
+    var angle = startAngle + step * i;
+    bullets.push({
+      x: player.x,
+      y: player.y,
+      vx: Math.cos(angle) * CONFIG.SHOTGUN_PELLET_SPEED,
+      vy: Math.sin(angle) * CONFIG.SHOTGUN_PELLET_SPEED,
+      life: CONFIG.SHOTGUN_PELLET_LIFE,
+      dmg: CONFIG.SHOTGUN_PELLET_DMG,
+      radius: CONFIG.SHOTGUN_PELLET_RADIUS,
+      knockback: CONFIG.SHOTGUN_KNOCKBACK,
+    });
+  }
+
+  // Wide muzzle flash + a noticeably stronger shake than the pistol's.
+  muzzleFlashX = player.x + dirX * CONFIG.MUZZLE_TIP_DIST;
+  muzzleFlashY = player.y + dirY * CONFIG.MUZZLE_TIP_DIST;
+  muzzleFlashAngle = baseAngle;
+  muzzleFlashTimer = CONFIG.MUZZLE_FLASH_TIME;
+  muzzleFlashSize = CONFIG.SHOTGUN_MUZZLE_FLASH_SIZE;
+  screenShake = Math.max(screenShake, CONFIG.SHOTGUN_SHAKE_AMOUNT);
+  playSound("shotgun_boom");
+}
+
+function updateShotgun(dt) {
+  shotgunCooldown -= dt;
+  if (shotgunCooldown <= 0) {
+    var target = findNearestEnemy(CONFIG.SHOTGUN_RANGE);
+    if (target) {
+      fireShotgun(target);
+      shotgunCooldown = CONFIG.SHOTGUN_FIRE_INTERVAL;
+    }
+  }
 }
 
 function updatePistol(dt) {
@@ -523,6 +599,16 @@ function updateBullets(dt) {
         if (dist < e.radius + b.radius) {
           e.hp -= b.dmg;
           spawnDamageNumber(e.x, e.y, b.dmg);
+
+          // Shove the enemy away from the player (brutes shrug it off --
+          // GDD calls them "knock-resist").
+          if (b.knockback && e.type !== "brute") {
+            var kdx = e.x - player.x;
+            var kdy = e.y - player.y;
+            var kdist = Math.sqrt(kdx * kdx + kdy * kdy) || 1;
+            e.x += (kdx / kdist) * b.knockback;
+            e.y += (kdy / kdist) * b.knockback;
+          }
 
           if (e.hp <= 0) {
             enemies.splice(j, 1);
@@ -587,6 +673,7 @@ function update(dt) {
 
   updateEnemies(dt);
   updatePistol(dt);
+  updateShotgun(dt);
   updateBullets(dt);
   updateDamageNumbers(dt);
   updateHud();
@@ -749,10 +836,10 @@ function drawMuzzleFlash() {
   ctx.rotate(muzzleFlashAngle);
   ctx.drawImage(
     ASSETS["vfx_muzzle"],
-    -CONFIG.MUZZLE_FLASH_SIZE / 2,
-    -CONFIG.MUZZLE_FLASH_SIZE / 2,
-    CONFIG.MUZZLE_FLASH_SIZE,
-    CONFIG.MUZZLE_FLASH_SIZE
+    -muzzleFlashSize / 2,
+    -muzzleFlashSize / 2,
+    muzzleFlashSize,
+    muzzleFlashSize
   );
   ctx.restore();
 }
