@@ -16,6 +16,15 @@ var CONFIG = {
   CANVAS_W: 1280,
   CANVAS_H: 720,
   DT_CLAMP: 0.033, // max seconds per frame (protects against tab-switch lag spikes)
+
+  WORLD_W: 2500, // arena size (per game-design.md section 2)
+  WORLD_H: 2500,
+
+  PLAYER_SPEED: 230, // px/sec
+  PLAYER_HP_MAX: 100,
+  PLAYER_MAGNET: 80, // gem pickup radius, used in a later prompt
+  PLAYER_SPRITE_W: 32, // draw size (GDD: soldier 32x42)
+  PLAYER_SPRITE_H: 42,
 };
 
 // -------------------------------------------------------------
@@ -26,6 +35,20 @@ var CONFIG = {
 var STATE = {
   mode: "title", // title -> play -> ... (more modes added in later prompts)
   lastTime: 0,   // timestamp of previous animation frame, for computing dt
+};
+
+// The player, dropped in the middle of the world to start.
+var player = {
+  x: CONFIG.WORLD_W / 2,
+  y: CONFIG.WORLD_H / 2,
+  hp: CONFIG.PLAYER_HP_MAX,
+  angle: 0, // radians, which way the sprite is rotated to face
+};
+
+// Camera = top-left corner of the view into the world, in world pixels.
+var camera = {
+  x: 0,
+  y: 0,
 };
 
 // -------------------------------------------------------------
@@ -99,6 +122,26 @@ window.addEventListener("keyup", function (e) {
   KEYS[e.key.toLowerCase()] = false;
 });
 
+// Reads WASD + arrow keys and returns a normalized {dx, dy} direction,
+// so diagonal movement isn't faster than straight movement.
+function getMoveVector() {
+  var dx = 0;
+  var dy = 0;
+
+  if (KEYS["w"] || KEYS["arrowup"]) dy -= 1;
+  if (KEYS["s"] || KEYS["arrowdown"]) dy += 1;
+  if (KEYS["a"] || KEYS["arrowleft"]) dx -= 1;
+  if (KEYS["d"] || KEYS["arrowright"]) dx += 1;
+
+  if (dx !== 0 && dy !== 0) {
+    // Diagonal: scale down so length stays 1 (1/sqrt(2)).
+    dx *= 0.7071;
+    dy *= 0.7071;
+  }
+
+  return { dx: dx, dy: dy };
+}
+
 // -------------------------------------------------------------
 // SECTION: AUDIO (stub)
 // Real WebAudio oscillator SFX come in a later prompt. For now
@@ -121,7 +164,29 @@ function audioInit() {
 function update(dt) {
   if (STATE.mode !== "play") return; // only simulate while actually playing
 
+  // --- move player ---
+  var move = getMoveVector();
+  player.x += move.dx * CONFIG.PLAYER_SPEED * dt;
+  player.y += move.dy * CONFIG.PLAYER_SPEED * dt;
+
+  // keep player inside the world bounds
+  player.x = clamp(player.x, 0, CONFIG.WORLD_W);
+  player.y = clamp(player.y, 0, CONFIG.WORLD_H);
+
+  // rotate sprite to face movement direction (art faces UP at angle 0)
+  if (move.dx !== 0 || move.dy !== 0) {
+    player.angle = Math.atan2(move.dx, -move.dy);
+  }
+
+  // --- camera follows player, clamped so it never shows outside the world ---
+  camera.x = clamp(player.x - CONFIG.CANVAS_W / 2, 0, CONFIG.WORLD_W - CONFIG.CANVAS_W);
+  camera.y = clamp(player.y - CONFIG.CANVAS_H / 2, 0, CONFIG.WORLD_H - CONFIG.CANVAS_H);
+
   // (future gameplay code goes here)
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
 }
 
 // -------------------------------------------------------------
@@ -131,14 +196,17 @@ function update(dt) {
 // -------------------------------------------------------------
 var canvas = document.getElementById("game");
 var ctx = canvas.getContext("2d");
+var bgPattern = null; // built once bg_asphalt.png has loaded
 
 function render() {
-  // Dark arena background for now -- real tiled bg_asphalt.png
-  // comes in the next prompt (Soldier + Camera).
+  // Fallback flat color in case the pattern isn't ready yet.
   ctx.fillStyle = "#141414";
   ctx.fillRect(0, 0, CONFIG.CANVAS_W, CONFIG.CANVAS_H);
 
-  if (!assetsReady) {
+  if (assetsReady) {
+    drawTiledBackground();
+    drawPlayer();
+  } else {
     ctx.fillStyle = "#e6e6e6";
     ctx.font = "20px Arial";
     ctx.fillText(
@@ -149,6 +217,40 @@ function render() {
   }
 
   // (future gameplay drawing goes here)
+}
+
+// Tiles bg_asphalt.png across the whole world, offset by the camera so it
+// looks like one giant floor instead of a fixed image behind the canvas.
+function drawTiledBackground() {
+  if (!bgPattern) {
+    bgPattern = ctx.createPattern(ASSETS["bg_asphalt"], "repeat");
+  }
+
+  ctx.save();
+  ctx.translate(-camera.x, -camera.y);
+  ctx.fillStyle = bgPattern;
+  // Fill exactly the area the camera can see (in world space).
+  ctx.fillRect(camera.x, camera.y, CONFIG.CANVAS_W, CONFIG.CANVAS_H);
+  ctx.restore();
+}
+
+// Draws the soldier at its screen position (world pos minus camera),
+// rotated to face the direction it's moving.
+function drawPlayer() {
+  var screenX = player.x - camera.x;
+  var screenY = player.y - camera.y;
+
+  ctx.save();
+  ctx.translate(screenX, screenY);
+  ctx.rotate(player.angle);
+  ctx.drawImage(
+    ASSETS["chr_soldier"],
+    -CONFIG.PLAYER_SPRITE_W / 2,
+    -CONFIG.PLAYER_SPRITE_H / 2,
+    CONFIG.PLAYER_SPRITE_W,
+    CONFIG.PLAYER_SPRITE_H
+  );
+  ctx.restore();
 }
 
 // -------------------------------------------------------------
