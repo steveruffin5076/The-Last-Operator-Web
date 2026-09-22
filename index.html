@@ -103,7 +103,18 @@
   #hud-hp-bar {
     width: 100%;
     height: 100%;
-    background: #e33; /* red/green per GDD, JS will flip color */
+    background: #3ecf5e; /* green when healthy, JS flips to red when low */
+  }
+
+  #hud-hp-text {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    font-weight: bold;
+    text-shadow: 1px 1px 0 #000;
   }
 
   /* ---- Overlay: covers the whole game area for title/pause/end screens ---- */
@@ -161,7 +172,7 @@
       <div id="hud-timer">10:00</div>
       <div id="hud-kills">Kills: 0</div>
       <div id="hud-xp-wrap"><div id="hud-xp-bar"></div></div>
-      <div id="hud-hp-wrap"><div id="hud-hp-bar"></div></div>
+      <div id="hud-hp-wrap"><div id="hud-hp-bar"></div><div id="hud-hp-text">100/100</div></div>
     </div>
 
     <!-- Overlay: title screen right now, reused later for pause/win/lose -->
